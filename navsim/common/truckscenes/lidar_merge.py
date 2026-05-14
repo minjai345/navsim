@@ -6,8 +6,9 @@ RIGHT/REAR) as individual PCD files; each load gives (4, N) with
 [x, y, z, intensity, ring, lidar_id] (see navsim/common/enums.py:LidarIndex).
 
 Strategy (decided in design discussion):
-  - Transform each LiDAR's points into the ego frame using its
-    `calibrated_sensor` extrinsics, then concatenate.
+  - Transform each LiDAR's points into the EGO BODY frame using its
+    `calibrated_sensor` extrinsics (which TruckScenes already expresses
+    relative to ego, per docs/schema_truckscenes.md).
   - Synthesize the `lidar_id` channel by tagging points 0..5 by source
     channel. Order is fixed by `TRUCKSCENES_LIDAR_CHANNELS` so the same id
     always means the same physical sensor across the dataset.
@@ -15,7 +16,7 @@ Strategy (decided in design discussion):
     indices; the current transfuser-truckscenes pipeline does not consume
     this channel either).
 
-This matches the merge logic already proven in
+Matches the merge logic already proven in
 transfuser-truckscenes/dataset/dataset.py:_get_lidar_feature (the (3, N)
 slice). We add the intensity column plus the two synthetic channels here.
 """
@@ -48,12 +49,43 @@ def merge_truckscenes_lidars(sample: dict, ts) -> npt.NDArray[np.float32]:
     Missing channels are skipped silently (so a frame with e.g. REAR dropout
     still produces a usable point cloud).
 
-    TODO:
-      - Port extrinsic transform from transfuser-truckscenes/dataset/dataset.py
-        _get_lidar_feature (sensor -> ego via calibrated_sensor).
-      - Decide whether to drop intensity (navsim downstream may not consume
-        it; current transfuser path drops to (3, N) before histogram).
-        Keeping it here preserves the (6, N) contract; truck FeatureBuilder
-        can slice as needed.
+    :param sample: TruckScenes `sample` record.
+    :param ts: initialized TruckScenes devkit instance.
+    :return: (6, N) float32 array, possibly with N=0 if no LiDARs available.
     """
-    raise NotImplementedError("lidar_merge.merge_truckscenes_lidars: skeleton")
+    from pathlib import Path
+    from pyquaternion import Quaternion
+    from truckscenes.utils.data_classes import LidarPointCloud
+
+    columns = []
+    for lidar_id, channel in enumerate(TRUCKSCENES_LIDAR_CHANNELS):
+        if channel not in sample["data"]:
+            continue
+        sd = ts.get("sample_data", sample["data"][channel])
+        cs = ts.get("calibrated_sensor", sd["calibrated_sensor_token"])
+
+        # Load (4, N): [x, y, z, intensity]. Devkit auto-detects PCD format.
+        pc = LidarPointCloud.from_file(str(Path(ts.dataroot) / sd["filename"]))
+        n = pc.points.shape[1]
+        if n == 0:
+            continue
+
+        # Sensor frame -> ego body frame.
+        # calibrated_sensor stores R, t in EGO frame
+        # (truckscenes-devkit docs/schema_truckscenes.md):
+        #     p_ego = R @ p_sensor + t
+        R = Quaternion(cs["rotation"]).rotation_matrix          # (3, 3)
+        t = np.asarray(cs["translation"], dtype=np.float64)     # (3,)
+        xyz_ego = (R @ pc.points[:3]).astype(np.float32)        # (3, N)
+        xyz_ego += t.astype(np.float32).reshape(3, 1)
+        intensity = pc.points[3:4].astype(np.float32)           # (1, N)
+        # Synthetic channels.
+        ring = np.zeros((1, n), dtype=np.float32)
+        lidar_id_row = np.full((1, n), lidar_id, dtype=np.float32)
+
+        # Stack into (6, N) for this lidar; concat across lidars after the loop.
+        columns.append(np.vstack([xyz_ego, intensity, ring, lidar_id_row]))
+
+    if not columns:
+        return np.zeros((6, 0), dtype=np.float32)
+    return np.concatenate(columns, axis=1)
