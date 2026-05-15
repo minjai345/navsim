@@ -89,16 +89,34 @@ class TruckTransfuserAgent(AbstractAgent):
         self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()})
 
     def get_sensor_config(self) -> SensorConfig:
-        """Load every cam + lidar slot at the latest history frame.
+        """Enable only the 4 cam slots TruckScenes populates + lidar.
 
-        Only cam_l0/r0/l2/r2 carry TruckScenes images; the remaining 4
-        navsim slots stay empty (handled by the FeatureBuilder's
-        camera-stitch step which only reads the 4 used slots).
+        navsim's `Cameras.from_camera_dict` tries to subscript
+        `camera_dict[name]["data_path"]` whenever the slot is in the
+        enabled list. Empty TruckScenes slots are emitted as None
+        entries, so enabling ALL eight slots (the vanilla
+        `build_all_sensors([3])` pattern) raises
+        `TypeError: 'NoneType' object is not subscriptable` on the
+        first None slot. Enable only the 4 cams the truck adapter
+        actually populates -- the remaining 4 are passed through as
+        empty `Camera()` instances via the else branch in
+        from_camera_dict.
+
+        `[3]` assumes 4 history frames (navsim default). When we expose
+        num_history_frames on the config, derive the iteration list
+        from it.
         """
-        # TODO: derive the history-index list from num_history_frames
-        # once we expose it on the config. `[3]` assumes 4 history frames
-        # (current navsim default).
-        return SensorConfig.build_all_sensors(include=[3])
+        return SensorConfig(
+            cam_f0=False,
+            cam_l0=[3],
+            cam_l1=False,
+            cam_l2=[3],
+            cam_r0=[3],
+            cam_r1=False,
+            cam_r2=[3],
+            cam_b0=False,
+            lidar_pc=[3],
+        )
 
     def get_feature_builders(self) -> List[AbstractFeatureBuilder]:
         return [TruckTransfuserFeatureBuilder(config=self._config)]
