@@ -1,0 +1,33 @@
+# Hydra config for TruckDiffusionDriveAgent.
+#
+# Truck-adapted DiffusionDrive: same V2TransfuserModel + diffusion
+# decoder + upstream `transfuser_loss`, but 4-cam stitched input, no HD
+# map (bev_semantic_weight=0), and TruckScenes-trained k-means anchor.
+#
+# `plan_anchor_path` MUST point to a .npy with shape
+# (num_clusters, num_future_poses, 2) produced by
+# `checks/compute_truck_kmeans_anchor.py`. The path below assumes the
+# script was run on B200 with `--output data/truck_kmeans_anchor_20_8.npy`.
+# Override on CLI if the file lives elsewhere.
+
+_target_: navsim.agents.truck_diffusiondrive.truck_diffusiondrive_agent.TruckDiffusionDriveAgent
+_convert_: 'all'
+
+config:
+  _target_: navsim.agents.truck_diffusiondrive.truck_diffusiondrive_config.TruckDiffusionDriveConfig
+  _convert_: 'all'
+
+  trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: 'all'
+    time_horizon: 4
+    interval_length: 0.5
+
+  # TruckScenes-trained anchor. Absolute path required.
+  plan_anchor_path: ${oc.env:NAVSIM_DEVKIT_ROOT}/data/truck_kmeans_anchor_20_8.npy
+
+  # All other fields inherit from TruckDiffusionDriveConfig defaults
+  # (camera_width 1536, lidar -32/+48, bev_semantic_weight 0, ...).
+
+checkpoint_path: null
+lr: 1e-4
