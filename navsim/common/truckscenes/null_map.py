@@ -1,39 +1,32 @@
-"""Minimal `AbstractMap` stub so navsim's `Scene` can be constructed without
-HD-map data.
+"""HD-map-less stub plugged into `Scene.map_api` for TruckScenes scenes.
 
-navsim's `Scene.map_api: AbstractMap` field is non-Optional (see
-navsim/common/dataclasses.py:333-339). TruckScenes has no HD map (no lane
-graph, no drivable polygons -- see project_map_free_pdms memory). To keep
-the upstream `Scene` dataclass unmodified we plug in a `NullMap` that
-satisfies the type contract.
+`Scene.map_api: AbstractMap` is non-Optional (see
+navsim/common/dataclasses.py). TruckScenes has no HD map (see
+project_map_free_pdms memory), so the truck adapter routes the
+`map_location="no_map"` case through the forked `Scene._build_map_api`
+to return this stub.
 
-Safety: this object is only ever instantiated for TruckScenes scenes. Any
-PDMS code path that *would* hit it has been forked elsewhere
-(navsim/planning/metric_caching/truck_*.py and the truck PDMS scorer fork)
-so the AbstractMap methods below should never be invoked in practice. They
-raise `NotImplementedError` defensively rather than returning empty data,
-to make it loud if a map-using code path slips through.
+Design choice: `NullMap` does NOT inherit from `AbstractMap`.
+
+  Why: `AbstractMap` has ~15 abstract methods. Subclassing forces every
+  method to be overridden just to instantiate (ABCMeta enforcement).
+  Python's dataclass / type-hint system is *not* enforced at runtime, so
+  setting `Scene.map_api = NullMap()` works as long as no code path
+  actually queries the map. For TruckScenes that path is guaranteed
+  silent: the truck FeatureBuilder / TargetBuilder never touch
+  `scene.map_api`, and the forked truck PDMS scorer (when written) will
+  skip every metric that needs an `AbstractMap`.
+
+If a code path that *was* expected to skip the map ever does try to
+query NullMap, AttributeError fires loudly -- which is the desired
+fail-fast behavior.
 """
-from nuplan.common.maps.abstract_map import AbstractMap
 
 
-class NullMap(AbstractMap):
-    """AbstractMap stub for HD-map-less datasets (TruckScenes).
+class NullMap:
+    """No-HD-map placeholder for TruckScenes scenes."""
 
-    All map queries raise. If you hit one of these, either the call site
-    needs to be guarded (`isinstance(map_api, NullMap)`) or the code path
-    needs to be moved to a TruckScenes-specific fork that does not consume
-    the map.
-    """
+    map_name = "no_map"
 
-    @property
-    def map_name(self) -> str:
-        return "no_map"
-
-    # TODO: enumerate the AbstractMap abstract methods that need to be
-    # implemented to make this class instantiable. nuplan's AbstractMap has
-    # ~15 abstract methods (get_proximal_map_objects, get_map_object, etc.).
-    # The simplest path is to implement each as
-    #     raise NotImplementedError(f"{type(self).__name__}.{<name>}: TruckScenes has no HD map")
-    # Concrete enumeration deferred to first integration smoke test, where
-    # Python will list every still-abstract method on instantiation.
+    def __repr__(self) -> str:  # pragma: no cover -- trivial
+        return "NullMap()"

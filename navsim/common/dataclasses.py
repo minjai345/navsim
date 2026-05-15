@@ -375,7 +375,17 @@ class Scene:
 
     @classmethod
     def _build_map_api(cls, map_name: str) -> AbstractMap:
-        """Helper classmethod to load map api from name."""
+        """Helper classmethod to load map api from name.
+
+        TruckScenes adapter convention: `map_name == "no_map"` returns a
+        NullMap stub (TruckScenes has no HD map). Any code path that
+        would query the map for TruckScenes scenes is expected to be
+        gated/forked elsewhere; if it isn't, NullMap will AttributeError
+        loudly. See navsim/common/truckscenes/null_map.py.
+        """
+        if map_name == "no_map":
+            from navsim.common.truckscenes.null_map import NullMap
+            return NullMap()
         assert map_name in MAP_LOCATIONS, f"The map name {map_name} is invalid, must be in {MAP_LOCATIONS}"
         return get_maps_api(NUPLAN_MAPS_ROOT, "nuplan-maps-v1.0", map_name)
 
@@ -465,6 +475,11 @@ class Scene:
                 ego_status=global_ego_status,
                 lidar=lidar,
                 cameras=cameras,
+                # TruckScenes-only side channel; absent on vanilla
+                # nuPlan/OpenScene pkls -> empty dict default.
+                truckscenes_extras=scene_dict_list[frame_idx].get(
+                    "truckscenes_extras", {}
+                ),
             )
             frames.append(frame)
 

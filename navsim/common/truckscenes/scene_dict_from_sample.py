@@ -127,9 +127,20 @@ def scene_dict_from_sample(
         heading_threshold_deg=driving_command_heading_deg,
     )
 
+    # Scene-level identifiers required by `Scene.from_scene_dict_list`.
+    # navsim's pkl format treats one pkl as one "log"; we use the
+    # TruckScenes scene_token for both `log_name` (pkl filename stem)
+    # and `scene_token`. `map_location="no_map"` triggers the
+    # forked `Scene._build_map_api` path that returns a NullMap stub
+    # (TruckScenes has no HD map).
+    scene_token = sample["scene_token"]
+
     return {
         "token": sample_token,
         "timestamp": int(sample["timestamp"]),
+        "log_name": scene_token,
+        "scene_token": scene_token,
+        "map_location": "no_map",
         "ego2global_translation": ego2global_translation,
         "ego2global_rotation": ego2global_rotation,
         "ego_dynamic_state": ego_dynamic_state,
@@ -279,10 +290,13 @@ def _build_annotations(ts, ref_sd, ego_pos: np.ndarray, ego_yaw: float) -> Dict[
         # devkit's effective track identity.
         track_tokens.append(ann["instance_token"])
 
+    # Key names use the `gt_` prefix expected by
+    # `Scene._build_annotations` (`gt_boxes`, `gt_names`, `gt_velocity_3d`).
+    # `instance_tokens` / `track_tokens` keep their bare names per navsim.
     return {
-        "boxes": np.asarray(boxes_list, dtype=np.float32).reshape(-1, 7),
-        "names": names_list,
-        "velocity_3d": np.asarray(velocity_list, dtype=np.float32).reshape(-1, 3),
+        "gt_boxes": np.asarray(boxes_list, dtype=np.float32).reshape(-1, 7),
+        "gt_names": names_list,
+        "gt_velocity_3d": np.asarray(velocity_list, dtype=np.float32).reshape(-1, 3),
         "instance_tokens": instance_tokens,
         "track_tokens": track_tokens,
     }
