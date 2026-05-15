@@ -32,7 +32,7 @@ from navsim.agents.truck_transfuser.truck_transfuser_features import (
     TruckTransfuserFeatureBuilder,
     TruckTransfuserTargetBuilder,
 )
-from navsim.common.dataclasses import Scene
+from navsim.common.dataclasses import AgentInput, Scene
 from navsim.planning.training.abstract_feature_target_builder import (
     AbstractFeatureBuilder,
     AbstractTargetBuilder,
@@ -40,11 +40,31 @@ from navsim.planning.training.abstract_feature_target_builder import (
 
 
 class TruckDiffusionDriveFeatureBuilder(TruckTransfuserFeatureBuilder):
-    """Identical features to the TruckTransfuser FeatureBuilder.
+    """Truck-adapted DiffusionDrive features.
 
-    Defined as a subclass for naming consistency only; downstream code
-    (e.g. cache `get_unique_name` collisions) benefits from a distinct
-    name when both agents are used in the same training pipeline.
+    Camera + LiDAR feature path is identical to TruckTransfuser (4-cam
+    stitch + BEV histogram, see TruckTransfuserFeatureBuilder). The
+    `status_feature` is REPLACED to match a VAD §4.2 shortcut-free
+    protocol -- a fair-comparison decision documented in the
+    project_paper_deadline / project_map_free_pdms memory:
+
+      Upstream DiffusionDrive: status_feature = concat(
+          driving_command (4D nuplan one-hot),
+          ego_velocity (2D),
+          ego_acceleration (2D),
+      ) -> shape (8,), Linear(8, tf_d_model).
+
+      Our truck variant: status_feature = driving_command (3D from
+      VAD-style trajectory heading threshold). Ego status omitted to
+      avoid the open-loop shortcut where vx*dt approximately equals
+      the future trajectory. Status encoder becomes Linear(3,
+      tf_d_model) -- see TruckV2TransfuserModel which patches it after
+      super().__init__.
+
+    Both TruckTransfuser and TruckDiffusionDrive baselines therefore
+    consume the SAME 3D driving_command input under the SAME shortcut
+    -free regime; the paper's articulation PDMS comparison is on equal
+    input footing.
     """
 
     def __init__(self, config: TruckDiffusionDriveConfig):
@@ -52,6 +72,16 @@ class TruckDiffusionDriveFeatureBuilder(TruckTransfuserFeatureBuilder):
 
     def get_unique_name(self) -> str:
         return "truck_diffusiondrive_feature"
+
+    def compute_features(self, agent_input: AgentInput) -> Dict[str, torch.Tensor]:
+        # Inherit camera + lidar (4-cam stitch + BEV histogram); replace
+        # status_feature with driving_command only (3D, no ego status).
+        ego = agent_input.ego_statuses[-1]
+        return {
+            "camera_feature": self._get_camera_feature(agent_input),
+            "lidar_feature": self._get_lidar_feature(agent_input),
+            "status_feature": torch.tensor(ego.driving_command, dtype=torch.float32),
+        }
 
 
 class TruckDiffusionDriveTargetBuilder(TruckTransfuserTargetBuilder):
