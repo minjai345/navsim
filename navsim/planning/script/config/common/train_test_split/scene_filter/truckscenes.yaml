@@ -1,0 +1,17 @@
+# SceneFilter for TruckScenes pkl logs produced by
+# `navsim.common.truckscenes.build_navsim_logs`.
+#
+# `has_route=false` is mandatory: TruckScenes has no HD map, so every
+# emitted frame dict has `roadblock_ids=[]`. Setting has_route=true here
+# would filter every scene out.
+#
+# `log_names: null` defers to the `train_logs` / `val_logs` lists passed
+# through the parent train_test_split config (or via CLI override).
+_target_: navsim.common.dataclasses.SceneFilter
+_convert_: 'all'
+num_history_frames: 4
+num_future_frames: 8
+frame_interval: 1
+has_route: false
+max_scenes: null
+log_names: null
