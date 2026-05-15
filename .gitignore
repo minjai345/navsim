@@ -15,7 +15,3 @@
 *.pkl
 *.jpg
 *.pcd
-
-# Local sanity-check scripts (personal smoke tests, parity checks, etc.).
-# Formal tests live under tests/ when we add a real test suite.
-checks/
