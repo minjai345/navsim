@@ -43,9 +43,13 @@ import numpy as np
 import numpy.typing as npt
 
 
-# PCD field layout matches navsim/common/enums.py:LidarIndex
-# (x, y, z, intensity, ring, lidar_id). All float32.
-_PCD_FIELDS = ("x", "y", "z", "intensity", "ring", "lidar_id")
+# PCD field layout for nuplan-devkit's PointCloud.to_pcd_bin2 (which
+# navsim Lidar.from_paths uses). Required field order: x, y, z,
+# intensity, ring, lidar_info. The 6th field is `lidar_info` (not
+# `lidar_id`!) per nuplan/database/utils/pointclouds/pointcloud.py;
+# navsim/common/enums.py:LidarIndex calls the same column `_LIDAR_ID`,
+# but the on-disk name is `lidar_info`.
+_PCD_FIELDS = ("x", "y", "z", "intensity", "ring", "lidar_info")
 
 
 def write_pcd_binary(path: Path, points: npt.NDArray[np.float32]) -> None:
