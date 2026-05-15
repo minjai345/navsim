@@ -19,20 +19,35 @@ Downstream consumer expectations:
     map, so every emitted frame dict has `roadblock_ids=[]`. Callers must
     set `has_route=False` (or filter scenes some other way) or every
     sample is dropped.
-  - PDMS metric caching does not consume sensor blobs (verified against
+  - PDMS metric caching does NOT need sensor blobs (verified against
     metric_cache_processor.py -- iterates ego state + annotations only).
-    This script therefore does NOT materialize merged LiDAR PCDs or
-    camera image copies. The lidar_path in every dict is None and cams
-    refer to TruckScenes' original image paths under $TRUCKSCENES.
+    Run WITHOUT --materialize-blobs for that use case; the emitted pkls
+    have `lidar_path=None` and cam `data_path` values relative to the
+    TruckScenes root (consumer must pass `sensor_blobs_path=$TRUCKSCENES`).
+  - Lightning-trainer training needs sensor blobs. Run WITH
+    --materialize-blobs: per-sample merged LiDAR is written as a binary
+    PCD under `<blob_dir>/lidars/<sample>.pcd` (matches nuplan-devkit's
+    `LidarPointCloud.from_buffer("pcd")`), and cam paths are rewritten
+    to absolute. Both become absolute, so the consumer can pass any
+    `sensor_blobs_path` (Path operator drops it when the right operand
+    is absolute).
 
-Usage:
+Usage (PDMS / metadata only):
     python -m navsim.common.truckscenes.build_navsim_logs \\
         --truckscenes-root $TRUCKSCENES \\
-        --version v1.1-trainval \\
+        --version v1.2-trainval \\
         --output-dir /path/to/navsim_truck_logs/ \\
         [--scene-tokens TOKEN1 TOKEN2 ...] \\
-        [--max-scenes N] \\
-        [--num-workers N]
+        [--max-scenes N] [--num-workers N]
+
+Usage (training-ready, with sensor blobs):
+    python -m navsim.common.truckscenes.build_navsim_logs \\
+        --truckscenes-root $TRUCKSCENES \\
+        --version v1.2-trainval \\
+        --output-dir /path/to/navsim_truck_logs/ \\
+        --materialize-blobs \\
+        --blob-dir /path/to/sensor_blobs/ \\
+        [--max-scenes N] [--num-workers N]
 """
 import argparse
 import multiprocessing as mp
@@ -61,12 +76,18 @@ def _build_one_log(
     truckscenes_root: Path,
     version: str,
     output_dir: Path,
+    materialize_blobs: bool,
+    blob_dir: Optional[Path],
 ) -> Tuple[str, Optional[str]]:
     """Worker entry: build and pickle one log. Returns (scene_token, error).
 
     A separate `TruckScenes` instance is constructed per worker so each
     process has its own device IO context (the devkit is not designed for
     cross-process sharing of a single instance).
+
+    When `materialize_blobs=True`, per-sample sensor blobs are written
+    under `blob_dir` and the scene_dict paths are rewritten to absolute
+    via `materialize.materialize_scene_dict_blobs`.
     """
     try:
         # Imports inside the worker so the parent process need not load
@@ -76,13 +97,22 @@ def _build_one_log(
         from navsim.common.truckscenes.scene_dict_from_sample import (
             scene_dict_from_sample,
         )
+        if materialize_blobs:
+            from navsim.common.truckscenes.materialize import (
+                materialize_scene_dict_blobs,
+            )
 
         ts = TruckScenes(version=version, dataroot=str(truckscenes_root), verbose=False)
 
         sample_tokens = _iter_scene_sample_tokens(ts, scene_token)
         scene_dict_list = []
         for sample_token in sample_tokens:
-            scene_dict_list.append(scene_dict_from_sample(ts, sample_token))
+            sd = scene_dict_from_sample(ts, sample_token)
+            if materialize_blobs:
+                materialize_scene_dict_blobs(
+                    sd, ts=ts, truckscenes_root=truckscenes_root, blob_dir=blob_dir
+                )
+            scene_dict_list.append(sd)
 
         output_path = output_dir / f"{scene_token}.pkl"
         # Atomic write: pickle to a tmp file then rename so a partial write
@@ -167,9 +197,27 @@ def main() -> None:
         help="Number of worker processes. Each instantiates its own "
              "TruckScenes devkit handle.",
     )
+    parser.add_argument(
+        "--materialize-blobs",
+        action="store_true",
+        help="Write merged LiDAR PCDs (under <blob-dir>/lidars/<sample>.pcd) "
+             "and rewrite scene_dict paths to absolute. Required for "
+             "Lightning-trainer training; not needed for PDMS-eval-only.",
+    )
+    parser.add_argument(
+        "--blob-dir",
+        type=Path,
+        default=None,
+        help="Directory to write materialized sensor blobs into. Defaults "
+             "to <output-dir>/sensor_blobs/ when --materialize-blobs is set.",
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.materialize_blobs:
+        if args.blob_dir is None:
+            args.blob_dir = args.output_dir / "sensor_blobs"
+        args.blob_dir.mkdir(parents=True, exist_ok=True)
 
     scene_tokens = _resolve_scene_tokens(
         truckscenes_root=args.truckscenes_root,
@@ -185,6 +233,8 @@ def main() -> None:
         truckscenes_root=args.truckscenes_root,
         version=args.version,
         output_dir=args.output_dir,
+        materialize_blobs=args.materialize_blobs,
+        blob_dir=args.blob_dir,
     )
 
     failures: List[Tuple[str, str]] = []

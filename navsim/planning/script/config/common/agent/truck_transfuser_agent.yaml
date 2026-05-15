@@ -1,0 +1,42 @@
+# Hydra config for TruckTransfuserAgent.
+#
+# Field defaults below mirror transfuser-truckscenes/configs/v9_cmd_no_status.py
+# (truck-only baseline: VAD §4.2 ego-status omission + driving_command +
+# wider forward BEV + ground plane). v3 baseline parity is achievable by
+# removing the overrides under `config:` and reverting to
+# TruckTransfuserConfig defaults.
+#
+# Known gap vs v9: optimizer is Adam (vanilla navsim TransfuserAgent
+# convention). v9 uses AdamW + weight_decay=0.01 + cosine annealing +
+# 2-epoch warmup. Matching requires extending TruckTransfuserAgent's
+# `get_optimizers` to accept those knobs; deferred -- training works with
+# Adam + fixed lr today, just not numerically identical to v9.
+
+_target_: navsim.agents.truck_transfuser.truck_transfuser_agent.TruckTransfuserAgent
+_convert_: 'all'
+
+config:
+  _target_: navsim.agents.truck_transfuser.truck_transfuser_config.TruckTransfuserConfig
+  _convert_: 'all'
+
+  # ===== BEV range (v9_cmd_no_status: forward-wider) =====
+  lidar_min_x: -32
+  lidar_max_x: 48
+  lidar_resolution_height: 320
+  lidar_vert_anchors: 10
+  use_ground_plane: true
+
+  # ===== Truck-only baseline (no trailer head) =====
+  # v9 drops the trailer head entirely so capacity exactly matches a
+  # tractor-only model (strict ablation). Trailer-head experiments override
+  # this in a sibling yaml.
+  use_trailer_head: false
+  trailer_weight: 0.0
+
+  # ===== VAD §4.2 status input setup =====
+  use_driving_command: true       # 3-way one-hot navigation intent
+  use_ego_status: false           # avoid open-loop shortcut learning
+  status_dropout_p: 0.0           # no-op when ego_status disabled
+
+checkpoint_path: null
+lr: 2e-4
