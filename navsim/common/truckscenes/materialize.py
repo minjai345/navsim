@@ -5,11 +5,15 @@ scene_dict so the consumer (`Lidar.from_paths`, `Cameras.from_camera_dict`)
 can find sensor data on disk:
 
   - LiDAR: the 6 TruckScenes channels are merged into one (6, N) float32
-    array (via `lidar_merge.merge_truckscenes_lidars`) and written as an
-    ASCII PCD with fields matching navsim's `LidarIndex` (x, y, z,
-    intensity, ring, lidar_id). nuplan-devkit's `pcd_to_numpy` reads
-    PCDs as text line-by-line, so binary PCDs are NOT supported -- we
-    use the ASCII flavor for compatibility.
+    array (via `lidar_merge.merge_truckscenes_lidars`) and written as a
+    **binary** PCD with fields matching navsim's `LidarIndex` (x, y, z,
+    intensity, ring, lidar_id). Critical: nuplan-devkit exposes TWO
+    different PCD readers with OPPOSING format requirements:
+      * `LidarPointCloud.from_file(path)` -> ASCII only (text iteration)
+      * `LidarPointCloud.from_buffer(bytes, "pcd")` -> BINARY only
+        (`PointCloud.parse` raises on `DATA ascii`).
+    navsim's runtime `Lidar.from_paths` calls `from_buffer`, so we MUST
+    emit binary. The standalone `from_file` API is informational only.
   - Camera: not materialized. The original TruckScenes image files are
     used as-is. We just rewrite the scene_dict cam `data_path` from the
     devkit-relative form to an absolute path so the consumer's
@@ -44,20 +48,19 @@ import numpy.typing as npt
 _PCD_FIELDS = ("x", "y", "z", "intensity", "ring", "lidar_id")
 
 
-def write_pcd_ascii(path: Path, points: npt.NDArray[np.float32]) -> None:
-    """Write (6, N) float32 array as an ASCII PCD with 6 float32 fields.
+def write_pcd_binary(path: Path, points: npt.NDArray[np.float32]) -> None:
+    """Write (6, N) float32 array as a binary PCD with 6 float32 fields.
 
-    Format consumable by nuplan-devkit's `pcd_to_numpy` (which reads PCDs
-    as text line-by-line). One row per point, six space-separated floats
-    per row, in the order x y z intensity ring lidar_id.
-
-    ASCII is ~2-3x larger than binary but the materialization run is
-    one-shot per dataset version; the slow write is acceptable.
+    Format consumable by nuplan-devkit's
+    `PointCloud.parse` (called from `LidarPointCloud.from_buffer(...,
+    "pcd")`). ASCII header followed by raw little-endian float32 bytes,
+    row-major (one point per row, 6 floats per row).
     """
     if points.ndim != 2 or points.shape[0] != 6:
-        raise ValueError(f"write_pcd_ascii expects (6, N), got {points.shape}")
+        raise ValueError(f"write_pcd_binary expects (6, N), got {points.shape}")
     n_points = int(points.shape[1])
-    # (6, N) -> (N, 6) for row-major write.
+    # PCD on-disk layout: N rows of 6 float32 fields. numpy (6, N) -> (N, 6)
+    # via transpose + ascontiguousarray so .tobytes() is row-major.
     rows = np.ascontiguousarray(points.astype(np.float32).T)
 
     header = (
@@ -71,17 +74,15 @@ def write_pcd_ascii(path: Path, points: npt.NDArray[np.float32]) -> None:
         "HEIGHT 1\n"
         "VIEWPOINT 0 0 0 1 0 0 0\n"
         f"POINTS {n_points}\n"
-        "DATA ascii\n"
-    )
+        "DATA binary\n"
+    ).encode("ascii")
 
     # Atomic write so a crashed run never leaves a half-finished pcd that
     # the consumer would happily try to parse.
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "w") as fp:
+    with open(tmp_path, "wb") as fp:
         fp.write(header)
-        # `%.4f` is enough precision for downstream BEV histograms and
-        # keeps the file ~half the size of full repr().
-        np.savetxt(fp, rows, fmt="%.4f")
+        fp.write(rows.tobytes())
     tmp_path.replace(path)
 
 
@@ -196,7 +197,7 @@ def materialize_scene_dict_blobs(
     sample_token = scene_dict["token"]
     sample = ts.get("sample", sample_token)
 
-    # ---- LiDAR: merge + write ASCII PCD ----
+    # ---- LiDAR: merge + write binary PCD ----
     lidars_dir = blob_dir / "lidars"
     lidars_dir.mkdir(parents=True, exist_ok=True)
     pcd_path = lidars_dir / f"{sample_token}.pcd"
@@ -206,7 +207,7 @@ def materialize_scene_dict_blobs(
         # lidar_path None so the consumer's empty-Lidar branch fires.
         scene_dict["lidar_path"] = None
     else:
-        write_pcd_ascii(pcd_path, points)
+        write_pcd_binary(pcd_path, points)
         scene_dict["lidar_path"] = str(pcd_path.resolve())
 
     # ---- Optional viz: BEV scatter + agent boxes ----
