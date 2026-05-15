@@ -40,3 +40,14 @@ config:
 
 checkpoint_path: null
 lr: 2e-4
+
+# ===== Optimizer / LR schedule (v9_cmd_no_status protocol, VAD §4.1) =====
+# Mirrors transfuser-truckscenes/train.py:190-214. AdamW with weight_decay
+# 0.01, 2-epoch linear warmup (start_factor=0.01), then CosineAnnealingLR
+# for the remaining epochs. `max_epochs` must match the Lightning
+# trainer's `trainer.params.max_epochs` -- override both together on CLI
+# if changing total schedule length.
+optimizer_type: adamw
+weight_decay: 0.01
+lr_warmup_epochs: 2
+max_epochs: 48

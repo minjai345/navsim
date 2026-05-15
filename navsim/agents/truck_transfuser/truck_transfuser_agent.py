@@ -19,12 +19,14 @@ exactly except for the truck-specific deltas:
     TruckScenes (the other 4 slots stay empty `Camera()`). This is the
     same `[3]` convention vanilla uses -- index 3 = last of 4 history
     frames.
-  - Optimizer hard-coded to Adam with `lr` to match the vanilla
-    interface. Experiment configs that need AdamW + weight_decay +
-    warmup (e.g. transfuser-truckscenes v6_lr_schedule onward) can
-    override via Lightning trainer wiring once that lands; we do not
-    plumb optimizer choice through TruckTransfuserConfig because navsim
-    treats training hyperparams as Lightning-side concerns.
+  - Optimizer / LR schedule are configurable via the agent's `__init__`
+    so a v9-equivalent run can be expressed in the Hydra yaml. Matches
+    the transfuser-truckscenes `_setup_optimizer_and_scheduler` shape
+    exactly (AdamW or Adam + optional LinearLR warmup + CosineAnnealing,
+    SequentialLR-combined). Hyperparam parity is required for the
+    direction-(ii) conformance test (#18) -- comparing navsim-form
+    loss curves against the prior v9_cmd_no_status_seed0 baseline is
+    only meaningful if optimizer choice / weight_decay / warmup match.
 """
 from typing import Any, Dict, List, Optional, Union
 
@@ -55,16 +57,33 @@ class TruckTransfuserAgent(AbstractAgent):
         self,
         config: TruckTransfuserConfig,
         lr: float,
+        optimizer_type: str = "adam",
+        weight_decay: float = 0.0,
+        lr_warmup_epochs: int = 0,
+        max_epochs: int = 100,
         checkpoint_path: Optional[str] = None,
     ):
         """
         :param config: TruckTransfuser model config.
-        :param lr: Adam learning rate.
+        :param lr: initial learning rate.
+        :param optimizer_type: "adam" (default, vanilla parity) or "adamw"
+            (v9_cmd_no_status protocol). AdamW uses `weight_decay`; Adam
+            also accepts it (0 default = identical to plain Adam).
+        :param weight_decay: passed to (Adam)W. v9 protocol = 0.01.
+        :param lr_warmup_epochs: epochs of linear warmup (start_factor=0.01).
+            0 = no warmup, CosineAnnealing starts from epoch 0. v9 = 2.
+        :param max_epochs: total training epochs (= CosineAnnealing T_max
+            after subtracting warmup). MUST match the Lightning
+            trainer's `max_epochs` -- caller responsibility.
         :param checkpoint_path: optional .ckpt path to restore from.
         """
         super().__init__()
         self._config = config
         self._lr = lr
+        self._optimizer_type = optimizer_type
+        self._weight_decay = weight_decay
+        self._lr_warmup_epochs = lr_warmup_epochs
+        self._max_epochs = max_epochs
         self._checkpoint_path = checkpoint_path
         self._truck_transfuser_model = TruckTransfuserModel(config)
 
@@ -146,7 +165,61 @@ class TruckTransfuserAgent(AbstractAgent):
     def get_optimizers(
         self,
     ) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
-        return torch.optim.Adam(self._truck_transfuser_model.parameters(), lr=self._lr)
+        """Return Lightning-style {optimizer, lr_scheduler} dict.
+
+        Mirrors transfuser-truckscenes/train.py:190-214 exactly so a v9
+        config (`optimizer_type="adamw", weight_decay=0.01,
+        lr_warmup_epochs=2, max_epochs=48`) reproduces the same schedule
+        the prior baselines were trained with. With defaults
+        (optimizer_type="adam", weight_decay=0.0, lr_warmup_epochs=0)
+        the behavior matches vanilla navsim's TransfuserAgent.
+
+        Schedule:
+          - LinearLR warmup (start_factor=0.01) for lr_warmup_epochs.
+          - CosineAnnealingLR for the remainder (T_max = max_epochs
+            - lr_warmup_epochs).
+          - SequentialLR combines the two at the warmup milestone.
+          - When lr_warmup_epochs == 0, cosine annealing alone (T_max =
+            max_epochs).
+          - Scheduler steps per EPOCH, not per training batch -- matches
+            transfuser-truckscenes/train.py and avoids needing a
+            steps-per-epoch estimate at agent construction time.
+        """
+        params = self._truck_transfuser_model.parameters()
+        if self._optimizer_type.lower() == "adamw":
+            optimizer = torch.optim.AdamW(params, lr=self._lr, weight_decay=self._weight_decay)
+        elif self._optimizer_type.lower() == "adam":
+            optimizer = torch.optim.Adam(params, lr=self._lr, weight_decay=self._weight_decay)
+        else:
+            raise ValueError(
+                f"Unknown optimizer_type {self._optimizer_type!r}; expected 'adam' or 'adamw'."
+            )
+
+        if self._lr_warmup_epochs > 0:
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.01, total_iters=self._lr_warmup_epochs
+            )
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self._max_epochs - self._lr_warmup_epochs
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup, cosine],
+                milestones=[self._lr_warmup_epochs],
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self._max_epochs
+            )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Empty until the truck-specific viz callback lands.
