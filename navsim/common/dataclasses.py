@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, BinaryIO, Union
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 import io
 import os
@@ -274,6 +274,14 @@ class Frame:
     ego_status: EgoStatus
     lidar: Lidar
     cameras: Cameras
+
+    # Truck-specific per-frame side channel for ego-attached state
+    # (trailer pose, hitch angle, ...). Empty dict for vanilla nuPlan/
+    # OpenScene data; populated only by the TruckScenes adapter
+    # (navsim.common.truckscenes.trailer_extras.build_trailer_extras).
+    # See project_map_free_pdms / project_dual_repo_structure memory entries
+    # for why trailer state lives here instead of in Annotations.
+    truckscenes_extras: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
