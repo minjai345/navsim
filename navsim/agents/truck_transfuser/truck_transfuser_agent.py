@@ -143,7 +143,19 @@ class TruckTransfuserAgent(AbstractAgent):
     def get_target_builders(self) -> List[AbstractTargetBuilder]:
         return [TruckTransfuserTargetBuilder(config=self._config)]
 
-    def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        features: Dict[str, torch.Tensor],
+        targets: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass.
+
+        The `targets` kwarg is accepted (and ignored) so this agent stays
+        compatible with the shared `AgentLightningModule._step` flow,
+        which now always passes `targets` (DiffusionDrive needs them at
+        train-time forward).
+        """
+        del targets
         return self._truck_transfuser_model(features)
 
     def compute_loss(
