@@ -30,8 +30,8 @@ import torch.nn as nn
 # values, and TransfuserBackbone consumes its config by field name (duck
 # typing), so passing a TruckTransfuserConfig works without inheritance.
 from navsim.agents.transfuser.transfuser_backbone import TransfuserBackbone
+from navsim.agents.truck_transfuser._indices import BoundingBox2DIndex
 from navsim.agents.truck_transfuser.truck_transfuser_config import TruckTransfuserConfig
-from navsim.agents.truck_transfuser.truck_transfuser_features import BoundingBox2DIndex
 from navsim.common.enums import StateSE2Index
 
 

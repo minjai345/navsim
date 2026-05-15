@@ -109,7 +109,11 @@ def scene_dict_from_sample(
 
     # Cameras and annotations.
     cams = build_cam_dict_for_navsim(sample, ts)
-    anns = _build_annotations(ts, ref_sd)
+    # Annotation conversion needs current ego pose (boxes are emitted in
+    # ego frame to match navsim's BoundingBoxIndex convention).
+    ego_pos = np.asarray(ego_pose["translation"], dtype=np.float64)
+    ego_yaw = _quaternion_to_yaw(ego_pose["rotation"])
+    anns = _build_annotations(ts, ref_sd, ego_pos, ego_yaw)
     extras = build_trailer_extras(sample, ts)
 
     # driving_command derived from the future ego trajectory (heading mode).
@@ -219,21 +223,24 @@ def _estimate_ego_velocity(ts, sample, ref_channel, max_time_diff=1.5):
     return float(vx), float(vy)
 
 
-def _build_annotations(ts, ref_sd) -> Dict[str, Any]:
+def _build_annotations(ts, ref_sd, ego_pos: np.ndarray, ego_yaw: float) -> Dict[str, Any]:
     """Build the per-frame `anns` dict in navsim shape.
 
-    Boxes are stored in GLOBAL frame (matches TruckScenes devkit defaults
-    from `get_boxes`). navsim/nuScenes scene_dicts also store global-frame
-    annotations; per-frame ego-frame conversion is done downstream when
-    targets are built. `vehicle.ego_trailer` is dropped here and routed
-    through `truckscenes_extras` instead.
+    Boxes are stored in this frame's EGO frame, matching navsim's
+    convention (see `navsim/common/enums.py:BoundingBoxIndex` and the
+    use of `_xy_in_lidar` directly against `box[X], box[Y]` in
+    `navsim.agents.transfuser.transfuser_features._compute_agent_targets`).
 
-    Box layout (per row): [x, y, z, w, l, h, yaw]. Matches the order most
-    common in nuScenes-derived adapters; downstream consumers that assume
-    [x, y, z, l, w, h, yaw] need to swap w/l (this is an annotation-format
-    convention question, not a derivation -- flagged for first-integration
-    sanity check).
+    Column layout matches `BoundingBoxIndex`:
+        [X, Y, Z, LENGTH, WIDTH, HEIGHT, HEADING]
+
+    TruckScenes devkit `box.wlh` orders dimensions as [width, length, height];
+    we swap to [length, width, height] to match navsim's expectation.
+    Trailer state lives in `truckscenes_extras` -- `vehicle.ego_trailer` is
+    dropped from this annotations dict.
     """
+    cos_y, sin_y = math.cos(-ego_yaw), math.sin(-ego_yaw)
+
     boxes_list = []
     names_list = []
     velocity_list = []
@@ -245,12 +252,25 @@ def _build_annotations(ts, ref_sd) -> Dict[str, Any]:
         if mapped is None:
             continue
         ann = ts.get("sample_annotation", box.token)
-        yaw = _quaternion_to_yaw(box.orientation.q)
-        # wlh order in TruckScenes: [width, length, height] (dataset.py:498).
-        w, l, h = float(box.wlh[0]), float(box.wlh[1]), float(box.wlh[2])
-        x, y, z = float(box.center[0]), float(box.center[1]), float(box.center[2])
 
-        boxes_list.append([x, y, z, w, l, h, yaw])
+        # Global -> ego frame (this frame's tractor ego_pose).
+        gx, gy, gz = float(box.center[0]), float(box.center[1]), float(box.center[2])
+        dx, dy = gx - float(ego_pos[0]), gy - float(ego_pos[1])
+        ex = dx * cos_y - dy * sin_y
+        ey = dx * sin_y + dy * cos_y
+        # Z is shared between global and ego (no roll/pitch correction --
+        # vanilla navsim does not do it either).
+        ez = gz - float(ego_pos[2])
+
+        box_yaw = _quaternion_to_yaw(box.orientation.q)
+        local_heading = (box_yaw - ego_yaw + math.pi) % (2 * math.pi) - math.pi
+
+        # devkit wlh = [width, length, height]; navsim wants [length, width, height].
+        w = float(box.wlh[0])
+        l = float(box.wlh[1])
+        h = float(box.wlh[2])
+
+        boxes_list.append([ex, ey, ez, l, w, h, local_heading])
         names_list.append(mapped)
         velocity_list.append(_box_velocity(ts, ann["token"]))
         instance_tokens.append(ann["instance_token"])

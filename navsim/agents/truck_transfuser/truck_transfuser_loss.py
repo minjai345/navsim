@@ -27,8 +27,8 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
+from navsim.agents.truck_transfuser._indices import BoundingBox2DIndex
 from navsim.agents.truck_transfuser.truck_transfuser_config import TruckTransfuserConfig
-from navsim.agents.truck_transfuser.truck_transfuser_features import BoundingBox2DIndex
 
 
 def truck_transfuser_loss(
