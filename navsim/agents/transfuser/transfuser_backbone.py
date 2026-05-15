@@ -4,19 +4,28 @@ Implements the TransFuser vision backbone.
 
 import copy
 import math
+from typing import TYPE_CHECKING
 
 import timm
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from navsim.agents.transfuser.transfuser_config import TransfuserConfig
+if TYPE_CHECKING:
+    # Lazy import: TransfuserConfig pulls in nuplan-devkit at module load
+    # time (for the bev_semantic_classes dict), which keeps this file
+    # unimportable in environments without nuplan installed. The backbone
+    # only uses config for type hints and duck-typed field access, so
+    # making the import TYPE_CHECKING-only lets the TruckScenes adapter
+    # reuse this class with TruckTransfuserConfig in environments that
+    # don't ship nuplan (see project_b200_training memory).
+    from navsim.agents.transfuser.transfuser_config import TransfuserConfig
 
 
 class TransfuserBackbone(nn.Module):
     """Multi-scale Fusion Transformer for image + LiDAR feature fusion."""
 
-    def __init__(self, config: TransfuserConfig):
+    def __init__(self, config: "TransfuserConfig"):
 
         super().__init__()
         self.config = config
