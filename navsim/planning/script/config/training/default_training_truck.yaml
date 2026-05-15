@@ -1,0 +1,73 @@
+# TruckScenes-specific training launcher.
+#
+# Differences from default_training.yaml:
+#   - default_train_val_test_log_split (nuplan tokens) replaced with
+#     truckscenes_train_val_log_split (v1.2-trainval scene tokens, 523
+#     train / 75 val per the devkit's official split).
+#   - Default agent = truck_transfuser_agent (v9_cmd_no_status protocol).
+#   - batch_size = 16, num_workers = 16, max_epochs = 48 to match the
+#     transfuser-truckscenes v9 run setup.
+#
+# `train_test_split` must still be passed on CLI (e.g.
+# `train_test_split=truckscenes_mini`) because navsim's `default_common`
+# requires it.
+#
+# Launch (after build_navsim_logs --materialize-blobs has finished):
+#
+#   python navsim/planning/script/run_training.py \
+#       --config-name default_training_truck \
+#       agent=truck_transfuser_agent \
+#       experiment_name=truck_navsim_v9_seed0 \
+#       train_test_split=truckscenes_mini \
+#       navsim_log_path=<pkls> sensor_blobs_path=<blobs>
+
+hydra:
+  run:
+    dir: ${output_dir}
+  output_subdir: ${output_dir}/code/hydra
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+  job:
+    chdir: False
+
+defaults:
+  - default_common
+  - default_evaluation
+  - truckscenes_train_val_log_split
+  - agent: truck_transfuser_agent
+  - _self_
+
+split: trainval
+cache_path: ${oc.env:NAVSIM_EXP_ROOT}/training_cache
+use_cache_without_dataset: false
+force_cache_computation: true
+seed: 0
+
+dataloader:
+  params:
+    batch_size: 16
+    num_workers: 16
+    pin_memory: true
+    prefetch_factor: 2
+
+trainer:
+  params:
+    max_epochs: 48
+    check_val_every_n_epoch: 1
+    val_check_interval: 1.0
+
+    limit_train_batches: 1.0
+    limit_val_batches: 1.0
+
+    accelerator: gpu
+    strategy: ddp
+    precision: 16-mixed
+    num_nodes: 1
+
+    num_sanity_val_steps: 0
+    fast_dev_run: false
+
+    accumulate_grad_batches: 1
+    gradient_clip_val: 0.0
+    gradient_clip_algorithm: norm
+    default_root_dir: ${output_dir}
