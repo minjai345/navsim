@@ -62,3 +62,15 @@ class TruckDiffusionDriveConfig(DiffusionDriveTransfuserConfig):
     # Empty -> upstream backbone load uses HF cache via
     # `timm.create_model(pretrained=True)` first (works on B200).
     bkb_path: str = ""
+
+    # ===== Truck builder-compat fields =====
+    # TruckTransfuser{Feature,Target}Builder accesses several flat
+    # fields that don't exist on upstream DiffusionDrive's
+    # TransfuserConfig. Mirror them here so the shared builder code
+    # works against this config.
+    # `num_poses` mirrors trajectory_sampling.num_poses (=8 default).
+    num_poses: int = 8
+    # `use_trailer_head` matches v9 truck-only baseline so the
+    # DiffusionDrive comparison stays apples-to-apples with v9. Flip
+    # to True only for an explicit trailer-head ablation.
+    use_trailer_head: bool = False
