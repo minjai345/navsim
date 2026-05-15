@@ -32,12 +32,24 @@ from navsim.agents.truck_diffusiondrive.truck_diffusiondrive_config import (
 
 
 class TruckV2TransfuserModel(V2TransfuserModel):
-    """V2TransfuserModel with a 3D-only status encoder."""
+    """V2TransfuserModel patched for the truck setup.
+
+    Two layers re-created after `super().__init__`:
+
+      1. `_status_encoding`: upstream is `Linear(4 + 2 + 2, d_model)`
+         for nuPlan's (driving_command 4D, vel 2D, accel 2D) layout.
+         Truck protocol uses driving_command (3D) only -- the VAD §4.2
+         shortcut-free regime, see truck_diffusiondrive_features.py.
+         Replaced with `Linear(3, d_model)`.
+      2. `_keyval_embedding`: upstream hardcodes `Embedding(8**2 + 1, ...)`
+         for vanilla 8x8 BEV grid + 1 status token. v9 truck baseline
+         widens the forward BEV to (-32, +48), so the post-/32-stem BEV
+         is 10x8 = 80 tokens + 1 status = 81. Replaced to compute the
+         grid size from config (matches TruckTransfuserModel's pattern).
+    """
 
     def __init__(self, config: TruckDiffusionDriveConfig):
         super().__init__(config)
-        # Replace status_encoding (Linear(8, d) -> Linear(3, d)) for the
-        # truck VAD-style protocol: driving_command only (3D), no ego
-        # status. status_feature shape from TruckDiffusionDriveFeatureBuilder
-        # is (3,) per sample.
         self._status_encoding = nn.Linear(3, config.tf_d_model)
+        n_keyval = config.lidar_vert_anchors * config.lidar_horz_anchors + 1
+        self._keyval_embedding = nn.Embedding(n_keyval, config.tf_d_model)
