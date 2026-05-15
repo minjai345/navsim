@@ -78,6 +78,7 @@ def _build_one_log(
     output_dir: Path,
     materialize_blobs: bool,
     blob_dir: Optional[Path],
+    viz: bool = False,
 ) -> Tuple[str, Optional[str]]:
     """Worker entry: build and pickle one log. Returns (scene_token, error).
 
@@ -110,7 +111,11 @@ def _build_one_log(
             sd = scene_dict_from_sample(ts, sample_token)
             if materialize_blobs:
                 materialize_scene_dict_blobs(
-                    sd, ts=ts, truckscenes_root=truckscenes_root, blob_dir=blob_dir
+                    sd,
+                    ts=ts,
+                    truckscenes_root=truckscenes_root,
+                    blob_dir=blob_dir,
+                    viz=viz,
                 )
             scene_dict_list.append(sd)
 
@@ -211,6 +216,12 @@ def main() -> None:
         help="Directory to write materialized sensor blobs into. Defaults "
              "to <output-dir>/sensor_blobs/ when --materialize-blobs is set.",
     )
+    parser.add_argument(
+        "--viz",
+        action="store_true",
+        help="Also write a BEV scatter + agent-box overlay PNG per sample "
+             "under <blob-dir>/viz/. Requires --materialize-blobs.",
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -228,6 +239,9 @@ def main() -> None:
     print(f"build_navsim_logs: {len(scene_tokens)} scene(s) to process "
           f"-> {args.output_dir}", flush=True)
 
+    if args.viz and not args.materialize_blobs:
+        parser.error("--viz requires --materialize-blobs")
+
     worker = partial(
         _build_one_log,
         truckscenes_root=args.truckscenes_root,
@@ -235,6 +249,7 @@ def main() -> None:
         output_dir=args.output_dir,
         materialize_blobs=args.materialize_blobs,
         blob_dir=args.blob_dir,
+        viz=args.viz,
     )
 
     failures: List[Tuple[str, str]] = []
