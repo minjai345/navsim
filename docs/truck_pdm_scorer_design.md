@@ -1,0 +1,289 @@
+# Truck PDM Scorer Design
+
+Design doc for the TruckScenes-adapted PDM scoring stack. Splits the
+work into two phases so that paper iteration on articulation metrics
+does not destabilize the underlying evaluation infrastructure.
+
+This doc is the single source of truth for the design decisions below;
+inline code comments may reference it (`see docs/truck_pdm_scorer_design.md`).
+
+
+## 1. Motivation
+
+The paper's contribution is an articulation-aware variant of the
+NAVSIM PDM Score (PDMS) suited to TruckScenes, where:
+
+  - There is **no HD map** (no lane graph, no drivable polygons, no
+    route plan). Roughly half of vanilla PDMS' sub-metrics consume
+    map data at cache-build OR scoring time -- see
+    `project_map_free_pdms` memory for the per-field analysis.
+  - The ego is **articulated** (tractor + trailer). Standard PDMS
+    treats the ego as a rigid box. The trailer's swept volume,
+    off-tracking, and hitch dynamics are exactly what we want to
+    measure but vanilla PDMS does not.
+
+Vanilla PDMS therefore cannot be applied to TruckScenes as-is, and a
+naive fork that bakes both adaptations into one scorer would tangle
+two different concerns:
+
+  1. **Map-free engineering**: making PDMS run on no-HD-map data.
+  2. **Articulation methodology**: defining and weighing
+     truck-specific metrics that constitute the paper contribution.
+
+Decoupling them lets us iterate on (2) -- the paper hook -- without
+breaking (1) -- the evaluation harness.
+
+
+## 2. Phase split
+
+| Phase | Scope | Paper status |
+|---|---|---|
+| **1. No-map navsim PDMS** | Strip map-dependent fields and sub-metrics; restore the standard PDMS subset that does not need a map. | Infrastructure. |
+| **2. Truck-specific metric plug-ins** | Articulation metrics (off-tracking, swept-volume collision, log-corridor compliance, ...) layered as additional `TruckMetric` plug-ins. | Contribution body. |
+
+
+## 3. Architecture
+
+Plug-in oriented: a small ABC + an orchestrator. Metric implementations
+live in two folders to keep Phase 1 / Phase 2 separable.
+
+```
+navsim/
+├── planning/
+│   ├── metric_caching/
+│   │   └── truck_metric_cache_processor.py
+│   │         class TruckMetricCacheProcessor
+│   │           - Fork of upstream MetricCacheProcessor.
+│   │           - Skips map-derived fields (centerline, route_lane_ids,
+│   │             drivable_area_map, map_parameters).
+│   │           - Keeps: observation (PDMObservation), ego_state,
+│   │             past_human_trajectory, future_tracked_objects.
+│   │           - Adds: waypoint_path (log ego future, used by ego_progress
+│   │             and log_corridor metrics).
+│   │
+│   └── simulation/planner/pdm_planner/scoring/truck/
+│       ├── __init__.py
+│       │
+│       ├── base_metric.py
+│       │     class TruckMetric(ABC)
+│       │       def name(self) -> str
+│       │       def score(self, scene, predicted_trajectory, cache) -> float
+│       │     class SafetyMetric(TruckMetric)    # multiplicative
+│       │     class QualityMetric(TruckMetric)   # weighted additive
+│       │
+│       ├── metrics/                              # Phase 1 (no-map PDMS subset)
+│       │   ├── history_comfort.py                  - kinematic, vanilla import
+│       │   ├── no_collision.py                     - box geometry, no fault attrib
+│       │   ├── ttc.py                              - intersection exemption removed
+│       │   ├── ego_progress.py                     - waypoint-based progress
+│       │   └── traffic_light.py                    - observation-only (if available)
+│       │
+│       ├── metrics_truck/                       # Phase 2 (paper contribution)
+│       │   ├── off_tracking_penalty.py             - trailer vs tractor rear-axle
+│       │   ├── swept_volume_collision.py           - articulated footprint check
+│       │   ├── log_corridor.py                     - drivable-area replacement
+│       │   └── hitch_stability.py  (optional)      - hitch angle rate penalty
+│       │
+│       ├── aggregator.py
+│       │     def pdms_aggregate(metric_scores: Dict[str, float],
+│       │                       weights: Dict[str, float]) -> float
+│       │       # safety_product = prod(SafetyMetric scores)
+│       │       # quality_sum = sum(weight_i * QualityMetric_i score)
+│       │       # return safety_product * quality_sum
+│       │
+│       └── truck_pdm_scorer.py
+│             class TruckPDMScorer
+│               def __init__(self, metrics: List[TruckMetric],
+│                            weights: Dict[str, float])
+│               def score_scene(self, scene, predicted_trajectory)
+│                   -> Dict[str, float]
+│                   # per-metric raw scores + aggregated PDMS scalar
+```
+
+### Why ABC + dependency injection (not hardcoded)
+
+Phase 2 iterates on metric design (especially off-tracking weight,
+log-corridor width). The orchestrator does not change between
+experiments -- only the `metrics` list passed in changes. This means
+a paper ablation table is generated by varying which metric instances
+are wired together at evaluation time.
+
+
+## 4. Phase 1: no-map navsim PDMS
+
+### 4.1 Sub-metric handling
+
+Reference: `project_map_free_pdms` memory § "NavSim PDMS code dependency analysis".
+
+| Vanilla sub-metric | Truck Phase 1 action | Rationale |
+|---|---|---|
+| `history_comfort` | **keep verbatim** | Kinematic (accel / jerk); no map use. |
+| `traffic_light_compliance` | **keep, fall-back** | Observation-driven; if TruckScenes has no traffic light annotation, return 1.0 (no violations possible). |
+| `no_at_fault_collisions` | **rewrite** (Phase 1) | Box-geometry collision check stays. Fault attribution drops the `ego_area_layers` (lane / intersection) check -- assume ego at fault for any collision. Phase 2 replaces with articulation-aware version. |
+| `time_to_collision_within_bound` | **rewrite** | Drop the "intersection-exempt" branch (no intersection polygons). |
+| `ego_progress` | **rewrite** | Replace `PDMPath.project()` along centerline with projection onto log ego trajectory's polyline. |
+| `drivable_area_compliance` | **drop** in Phase 1 | No drivable area polygons. Phase 2 `log_corridor` is the substitute. |
+| `driving_direction_compliance` | **drop** | Intersection / oncoming-lane logic gone. |
+| `lane_keeping` | **drop** in Phase 1 | Centerline lateral measure undefined. Phase 2 `off_tracking_penalty` is the philosophical successor (articulation-flavored). |
+
+### 4.2 Aggregation in Phase 1
+
+```
+PDMS_phase1 = (no_collision * ttc * traffic_light)         # safety, multiplicative
+              * (w_progress * ego_progress + w_comfort * history_comfort)  # quality
+```
+
+Weight defaults (placeholder; refine after first sanity):
+- `w_progress = 5.0`
+- `w_comfort = 2.0`
+
+These approximate vanilla PDMS weights (vanilla uses `ep_w=5`, `comfort_w=2`); Phase 2 may tune.
+
+### 4.3 TruckMetricCacheProcessor outputs
+
+Per-sample cache entries (mirroring vanilla `MetricCache` shape minus
+the map-derived fields):
+
+```python
+@dataclass
+class TruckMetricCache:
+    token: str
+    timestamp: int
+    ego_state: EgoState                          # current
+    past_human_trajectory: List[StateSE2]        # for comfort + history
+    waypoint_path: np.ndarray                    # (N, 3) log future ego SE2 poses
+                                                 #   -- replaces vanilla `centerline`
+                                                 #   for ego_progress + log_corridor
+    observation: PDMObservation                  # reuse upstream class
+                                                 #   (no map fields touched)
+    future_tracked_objects: List[...]            # for TTC + collision
+    trailer_path: np.ndarray (N, 3) | None       # Phase 2 input; populated when
+                                                 #   has_trailer at current frame
+```
+
+`waypoint_path` and `trailer_path` are computed at cache-build time from
+the TruckScenes-adapter `scene_dict_list` so the scorer side stays
+geometry-pure.
+
+
+## 5. Phase 2: truck-specific metric plug-ins
+
+Each is an additional `TruckMetric` instance wired into
+`TruckPDMScorer.metrics`. Phase 1 still works without them; turning
+them on extends the score.
+
+### 5.1 `off_tracking_penalty` (QualityMetric)
+
+Articulation paper hook.
+
+Definition (draft):
+```
+off_tracking(t) = lateral distance between trailer rear-axle
+                  path point at time t and the *interpolated* tractor
+                  rear-axle path point that the tractor traversed
+                  through the same arc-length earlier.
+
+OFF_TRACKING_score = 1 - clip(max_t off_tracking(t) / D_max, 0, 1)
+```
+
+`D_max` (max acceptable off-tracking before score is 0): TBD --
+literature suggests ~1.5 m for tractor-trailer combinations on highway
+geometry. Confirm with TruckScenes log statistics before fixing.
+
+### 5.2 `swept_volume_collision` (SafetyMetric)
+
+```
+swept(t) = union of tractor footprint(t) and trailer footprint(t)
+no_swept_collision = product over t of (swept(t) ∩ other_agent(t) == ∅)
+```
+
+Trailer footprint built from `Frame.truckscenes_extras["trailer_pose"]`
++ `trailer_length` + `trailer_width`.
+
+### 5.3 `log_corridor` (SafetyMetric or QualityMetric -- TBD)
+
+Replaces vanilla `drivable_area_compliance`. The "drivable corridor"
+is defined as a lateral strip around the log ego trajectory
+(`waypoint_path` from the cache).
+
+```
+inside_corridor(t) = |lateral_offset(predicted(t), log_path)| < W_corridor / 2
+log_corridor_score = mean over t of inside_corridor(t)
+```
+
+`W_corridor`: TBD. Literature: nuScenes-style ablations use ~3 m. For
+articulated trucks lateral footprint is wider -- start with 4-5 m and
+refine.
+
+### 5.4 `hitch_stability` (QualityMetric, optional)
+
+Penalizes abrupt hitch-angle changes that would jackknife a real truck.
+Only active when `truckscenes_extras["has_trailer"]`.
+
+
+## 6. Evaluation pipeline
+
+```
+checkpoint + Hydra config
+   │
+   ▼
+TruckPDMScorer.score_log(scene, checkpoint) -> Dict[str, float]
+   ├─ agent.compute_trajectory(scene_as_agent_input)
+   │     → predicted (num_poses, 3) trajectory
+   ├─ for each TruckMetric in scorer.metrics:
+   │     m.score(scene, predicted_trajectory, cache)
+   ├─ pdms_aggregate(...)
+   └─ emit one row per scene to a CSV
+
+scripts/evaluation/run_truck_pdm_score_evaluation.sh
+   - wraps the Hydra entry
+   - one script per (Phase 1 set, Phase 2 set) combination
+```
+
+The output CSV columns are `scene_token, <metric_name>_score, ..., pdms_total`.
+Aggregating across the test split yields the paper table row.
+
+
+## 7. Open decisions (deferred to Phase 2 iteration)
+
+| Item | Status |
+|---|---|
+| `D_max` for off-tracking | placeholder 1.5 m; finalize with log distribution |
+| `W_corridor` for log_corridor | placeholder 4-5 m; data-driven |
+| `log_corridor` safety vs quality classification | currently safety; could be quality if signal too noisy |
+| Hitch-angle stability inclusion | optional; ship if budget permits |
+| Trailer-head ablation: `OFF_TRACKING` w/ vs w/o trailer head | required for paper narrative |
+| `traffic_light_compliance` -- does TruckScenes annotate? | check devkit; fall-back to 1.0 if absent |
+
+
+## 8. Timeline
+
+| | Phase | Wall clock |
+|---|---|---|
+| 1 | TruckMetricCacheProcessor | 1-2 days |
+| 1 | base_metric ABC + 5 Phase 1 metrics + aggregator | 2-3 days |
+| 1 | TruckPDMScorer orchestrator + Hydra glue | 1 day |
+| 1 | Sanity test (2 scenes + checkpoint) | half day |
+| 1 | **Phase 1 total** | **~5-7 days** |
+| 2 | off_tracking_penalty | 1-2 days |
+| 2 | swept_volume_collision | 1 day |
+| 2 | log_corridor | 1 day |
+| 2 | (optional) hitch_stability | half day |
+| 2 | Tuning + ablation across paper splits | 2-3 days |
+| 2 | **Phase 2 total** | **~5-7 days** |
+
+Running against the AAAI-26 timeline (see
+[project_paper_deadline](../../../.claude/projects/-home-minjai-projects-transfuser-truckscenes/memory/project_paper_deadline.md)):
+both phases fit comfortably within the 6-week budget before full-paper
+submission, leaving ~3-4 weeks for writing + revision.
+
+
+## 9. References
+
+  - `project_map_free_pdms` memory (sub-metric keep/rewrite/drop table)
+  - `project_paper_deadline` memory (AAAI-26 schedule)
+  - `project_baseline_vs_kinematic_head` memory (trailer-head vs free-regression baseline framing)
+  - vanilla scorer at
+    `navsim/planning/simulation/planner/pdm_planner/scoring/pdm_scorer.py`
+  - vanilla cache builder at
+    `navsim/planning/metric_caching/metric_cache_processor.py`
