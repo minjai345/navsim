@@ -85,13 +85,13 @@ class TruckDiffusionDriveFeatureBuilder(TruckTransfuserFeatureBuilder):
 
 
 class TruckDiffusionDriveTargetBuilder(TruckTransfuserTargetBuilder):
-    """Truck targets + a zeros-filled bev_semantic_map placeholder.
+    """Truck targets for DiffusionDrive.
 
-    The placeholder satisfies upstream `diffusiondrive.transfuser_loss`'s
-    unconditional `targets["bev_semantic_map"]` lookup. Shape matches
-    `config.bev_semantic_frame = (bev_pixel_height, bev_pixel_width)` and
-    dtype is int64 (CE expects long class indices). All zeros = class 0
-    everywhere; weight=0 in the loss kills its contribution.
+    Same as `TruckTransfuserTargetBuilder` (trajectory + agent_states +
+    agent_labels + optional trailer). No `bev_semantic_map` key --
+    TruckScenes has no HD map, and our truck_transfuser_loss fork in
+    this package gates the BEV semantic CE on the key's presence, so
+    omitting it cleanly disables that loss branch.
     """
 
     def __init__(self, config: TruckDiffusionDriveConfig):
@@ -99,11 +99,3 @@ class TruckDiffusionDriveTargetBuilder(TruckTransfuserTargetBuilder):
 
     def get_unique_name(self) -> str:
         return "truck_diffusiondrive_target"
-
-    def compute_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:
-        targets = super().compute_targets(scene)
-        # Zeros placeholder for the BEV semantic head's CE loss.
-        # config.bev_semantic_frame returns (bev_pixel_height, bev_pixel_width).
-        h, w = self._config.bev_semantic_frame
-        targets["bev_semantic_map"] = torch.tensor(np.zeros((h, w), dtype=np.int64))
-        return targets

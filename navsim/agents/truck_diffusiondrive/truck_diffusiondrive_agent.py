@@ -24,7 +24,9 @@ AdamW + CosLR via upstream `WarmupCosLR`, forward signature
 `bev_semantic_map` head still emits its output; `bev_semantic_weight=0`
 in our config kills its loss contribution.
 """
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+import torch
 
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.agents.diffusiondrive.transfuser_agent import (
@@ -36,6 +38,9 @@ from navsim.agents.truck_diffusiondrive.truck_diffusiondrive_config import (
 from navsim.agents.truck_diffusiondrive.truck_diffusiondrive_features import (
     TruckDiffusionDriveFeatureBuilder,
     TruckDiffusionDriveTargetBuilder,
+)
+from navsim.agents.truck_diffusiondrive.truck_diffusiondrive_loss import (
+    truck_transfuser_loss,
 )
 from navsim.agents.truck_diffusiondrive.truck_diffusiondrive_model import (
     TruckV2TransfuserModel,
@@ -97,3 +102,12 @@ class TruckDiffusionDriveAgent(DiffusionDriveTransfuserAgent):
 
     def get_target_builders(self) -> List[AbstractTargetBuilder]:
         return [TruckDiffusionDriveTargetBuilder(config=self._config)]
+
+    def compute_loss(
+        self,
+        features: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        predictions: Dict[str, torch.Tensor],
+    ):
+        """Route to the truck-forked loss (bev_semantic CE gated)."""
+        return truck_transfuser_loss(targets, predictions, self._config)
