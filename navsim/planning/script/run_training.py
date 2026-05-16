@@ -128,7 +128,28 @@ def main(cfg: DictConfig) -> None:
     logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")
-    trainer = pl.Trainer(**cfg.trainer.params, callbacks=agent.get_training_callbacks())
+    # Optional Weights & Biases integration. Gated on cfg.wandb.enable so
+    # disabled-by-default callers (vanilla navsim invocations) are not
+    # broken by a missing wandb install. When enabled, the WandbLogger is
+    # constructed from `cfg.wandb` and passed to PyTorch Lightning's
+    # Trainer; rank-zero-only init is handled by Lightning itself.
+    pl_loggers = True  # Lightning default: TensorBoard.
+    if cfg.get("wandb") is not None and cfg.wandb.get("enable", False):
+        from pytorch_lightning.loggers import WandbLogger
+
+        pl_loggers = WandbLogger(
+            project=cfg.wandb.get("project", "truck_navsim"),
+            entity=cfg.wandb.get("entity", None),
+            name=cfg.get("experiment_name", None),
+            save_dir=str(cfg.output_dir),
+            tags=list(cfg.wandb.get("tags", []) or []),
+            log_model=False,
+        )
+    trainer = pl.Trainer(
+        **cfg.trainer.params,
+        callbacks=agent.get_training_callbacks(),
+        logger=pl_loggers,
+    )
 
     logger.info("Starting Training")
     trainer.fit(

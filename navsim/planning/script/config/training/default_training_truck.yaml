@@ -50,6 +50,15 @@ dataloader:
     pin_memory: true
     prefetch_factor: 2
 
+# Weights & Biases logging. Disable by setting wandb.enable=false on
+# the CLI or in a derived yaml. `name` is derived from `experiment_name`
+# at runtime inside run_training.py.
+wandb:
+  enable: true
+  project: truck_navsim_pdms
+  entity: null
+  tags: []
+
 trainer:
   params:
     max_epochs: 48

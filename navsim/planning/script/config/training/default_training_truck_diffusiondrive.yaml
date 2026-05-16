@@ -47,6 +47,13 @@ dataloader:
     pin_memory: true
     prefetch_factor: 2
 
+# Weights & Biases logging. Disable with wandb.enable=false on CLI.
+wandb:
+  enable: true
+  project: truck_navsim_pdms
+  entity: null
+  tags: []
+
 trainer:
   params:
     max_epochs: 100
