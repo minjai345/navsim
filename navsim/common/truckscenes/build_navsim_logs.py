@@ -78,6 +78,9 @@ def _build_one_log(
     output_dir: Path,
     materialize_blobs: bool,
     blob_dir: Optional[Path],
+    driving_command_mode: str,
+    driving_command_heading_deg: float,
+    driving_command_lateral_m: float,
     viz: bool = False,
 ) -> Tuple[str, Optional[str]]:
     """Worker entry: build and pickle one log. Returns (scene_token, error).
@@ -108,7 +111,13 @@ def _build_one_log(
         sample_tokens = _iter_scene_sample_tokens(ts, scene_token)
         scene_dict_list = []
         for sample_token in sample_tokens:
-            sd = scene_dict_from_sample(ts, sample_token)
+            sd = scene_dict_from_sample(
+                ts,
+                sample_token,
+                driving_command_mode=driving_command_mode,
+                driving_command_heading_deg=driving_command_heading_deg,
+                driving_command_lateral_m=driving_command_lateral_m,
+            )
             if materialize_blobs:
                 materialize_scene_dict_blobs(
                     sd,
@@ -222,6 +231,38 @@ def main() -> None:
         help="Also write a BEV scatter + agent-box overlay PNG per sample "
              "under <blob-dir>/viz/. Requires --materialize-blobs.",
     )
+    # driving_command derivation knobs. See docs/paper_open_decisions.md::D10
+    # for the heading-vs-lateral rationale. The default keeps the heading
+    # behaviour that existed before this flag landed, so existing scripts
+    # are not retroactively perturbed.
+    from navsim.common.truckscenes.scene_dict_from_sample import (
+        DEFAULT_DRIVING_COMMAND_HEADING_DEG,
+        DEFAULT_DRIVING_COMMAND_LATERAL_M,
+        DEFAULT_DRIVING_COMMAND_MODE,
+        DRIVING_COMMAND_MODES,
+    )
+    parser.add_argument(
+        "--driving-command-mode",
+        choices=DRIVING_COMMAND_MODES,
+        default=DEFAULT_DRIVING_COMMAND_MODE,
+        help="How driving_command is derived from the future ego trajectory. "
+             "'heading' (default) thresholds |Δyaw@4s|; 'lateral' thresholds "
+             "|local_y@4s|. See docs/paper_open_decisions.md::D10.",
+    )
+    parser.add_argument(
+        "--driving-command-heading-deg",
+        type=float,
+        default=DEFAULT_DRIVING_COMMAND_HEADING_DEG,
+        help="|Δyaw@4s| threshold (degrees) for the heading mode. "
+             "Default mirrors transfuser-truckscenes (15°).",
+    )
+    parser.add_argument(
+        "--driving-command-lateral-m",
+        type=float,
+        default=DEFAULT_DRIVING_COMMAND_LATERAL_M,
+        help="|local_y@4s| threshold (metres) for the lateral mode. "
+             "Default mirrors VAD's nuScenes converter (2.0 m).",
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -249,6 +290,9 @@ def main() -> None:
         output_dir=args.output_dir,
         materialize_blobs=args.materialize_blobs,
         blob_dir=args.blob_dir,
+        driving_command_mode=args.driving_command_mode,
+        driving_command_heading_deg=args.driving_command_heading_deg,
+        driving_command_lateral_m=args.driving_command_lateral_m,
         viz=args.viz,
     )
 

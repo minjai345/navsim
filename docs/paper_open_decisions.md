@@ -213,7 +213,68 @@ learned and trivial policies.
 sanity.
 
 
-## Active decision queue (chronological)
+## D10. driving_command derivation mode (heading vs lateral)
+
+**Status:** open -- ablation runs queued (2026-05-16)
+
+Current default in `scene_dict_from_sample.py` is heading-mode (|Δyaw@4s|
+threshold 15°), mirroring nuPlan/navsim's route-derived intent
+convention. The lateral-mode alternative (|local_y@4s| threshold 2m,
+VAD's nuScenes-converter pattern) catches lane changes that heading
+misses.
+
+| Mode | Catches | Misses | Convention |
+|---|---|---|---|
+| heading (15°) | intersection turns | lane changes | nuPlan / navsim (route-derived) |
+| lateral (2m) | turns + lane changes | gradual curves (big Δyaw, small Δy) | VAD / nuScenes converter |
+
+**Argument for lateral:** TruckScenes has no HD map / route plan, so the
+nuPlan route-derived semantics do not apply directly. Trajectory-derived
+signal is what we have, and lateral captures more semantic intent
+(lane changes are real maneuvers that should be observable to the
+model). Highway truck dataset has many lane changes; heading misses
+all of them.
+
+**Argument for heading:** transfuser-truckscenes v9_cmd_no_status
+(already-trained baseline) uses heading. Keeping heading allows 1:1
+comparison with that prior checkpoint set without re-deriving.
+
+**Decision plan:**
+- Train both variants on the navsim form (`truck_navsim_v9_seed0` =
+  heading [running], `truck_navsim_v9_lateral_seed0` [queued]).
+- After Phase 1 scorer runs, compare PDMS on both variants.
+- Pick the better-performing one as the paper's main result; cite the
+  other as an ablation row.
+
+**Implementation note:** `scene_dict_from_sample.py` now exposes a
+`driving_command_mode` parameter; `build_navsim_logs.py` exposes a
+matching CLI flag. Lateral pkls live in a separate output dir so the
+two pkl families do not collide.
+
+
+## D11. BEV range -- asymmetric (v9) vs symmetric wider (BEV-48)
+
+**Status:** open -- ablation run queued (2026-05-16)
+
+v9_cmd_no_status uses `x: -32 / +48, y: ±32` (forward-asymmetric 80m
+× 64m). The intuition is "highway truck sees far forward, narrow
+lateral." But this matters: if our articulation metrics emphasize
+turning maneuvers, a wider lateral BEV may help.
+
+**Candidate:** `x: ±48, y: ±48` (symmetric 96m × 96m). Pros:
+- Wider lateral coverage -> better at perceiving adjacent lanes /
+  turning agents
+- Symmetric -> easier to reason about in paper / figures
+- B200 has plenty of memory budget
+
+Cons:
+- 2.25x more BEV pixels -> slower forward (~25% wall clock per epoch)
+- Backward range 48m is wasteful for truck-forward driving
+
+**Decision plan:** train `truck_navsim_v9_bev48_seed0` (heading mode,
+BEV ±48), compare to v9 baseline (current). Pick the better.
+
+Active decision queue (chronological)
 
 | Order | Decision | Blocks |
 |---|---|---|

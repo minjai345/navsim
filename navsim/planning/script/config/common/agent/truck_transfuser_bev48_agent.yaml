@@ -1,0 +1,56 @@
+# TruckTransfuserAgent variant: symmetric ±48 m BEV (96 m × 96 m total).
+#
+# Same protocol as `truck_transfuser_agent.yaml` (v9_cmd_no_status) except
+# the LiDAR window is widened from the asymmetric x:[-32,+48], y:[-32,+32]
+# (80 m × 64 m) to a square ±48 in both axes. See
+# docs/paper_open_decisions.md::D11 for the rationale (wider lateral
+# coverage for turning maneuvers / paper figure symmetry).
+#
+# Pixel grid math (pixels_per_meter=4):
+#   width  = 96 m * 4 = 384  -> lidar_resolution_width  = 384
+#   height = 96 m * 4 = 384  -> lidar_resolution_height = 384
+#   horz_anchors = 384 / 32 = 12
+#   vert_anchors = 384 / 32 = 12
+#   total tokens = 12*12 + 1 = 145 (status slot).
+#
+# Memory impact: 2.25x BEV pixels vs the v9 config -> roughly +25% step
+# time. Acceptable on B200.
+#
+# driving_command derivation mode is unchanged (heading-mode, baked into
+# the pkls). Pair with the heading pkls; do NOT pair with lateral pkls.
+
+_target_: navsim.agents.truck_transfuser.truck_transfuser_agent.TruckTransfuserAgent
+_convert_: 'all'
+
+config:
+  _target_: navsim.agents.truck_transfuser.truck_transfuser_config.TruckTransfuserConfig
+  _convert_: 'all'
+
+  # ===== BEV range (D11: symmetric ±48 m) =====
+  lidar_min_x: -48
+  lidar_max_x: 48
+  lidar_min_y: -48
+  lidar_max_y: 48
+  lidar_resolution_height: 384
+  lidar_resolution_width: 384
+  lidar_vert_anchors: 12
+  lidar_horz_anchors: 12
+  use_ground_plane: true
+
+  # ===== Truck-only baseline (no trailer head) =====
+  use_trailer_head: false
+  trailer_weight: 0.0
+
+  # ===== VAD §4.2 status input setup =====
+  use_driving_command: true
+  use_ego_status: false
+  status_dropout_p: 0.0
+
+checkpoint_path: null
+lr: 2e-4
+
+# ===== Optimizer / LR schedule (v9 protocol, VAD §4.1) =====
+optimizer_type: adamw
+weight_decay: 0.01
+lr_warmup_epochs: 2
+max_epochs: 48

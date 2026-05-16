@@ -63,9 +63,19 @@ DEFAULT_NUM_FUTURE_FRAMES = 8
 # Heading-mode threshold for driving_command, in degrees, matching
 # transfuser-truckscenes/configs/_base.py:
 #   driving_command_threshold_heading_deg = 15.0.
-# Lateral mode is intentionally NOT supported here (paper protocol picks
-# heading; see project_map_free_pdms memory and the design discussion).
 DEFAULT_DRIVING_COMMAND_HEADING_DEG = 15.0
+
+# Lateral-mode threshold for driving_command, in metres. Mirrors VAD's
+# nuScenes converter (|local_y@4s| > 2.0 -> Left/Right). Catches lane
+# changes (small Δyaw, large lateral offset) that heading mode misses.
+# See docs/paper_open_decisions.md::D10 for the heading-vs-lateral
+# rationale.
+DEFAULT_DRIVING_COMMAND_LATERAL_M = 2.0
+
+# Allowed values for driving_command_mode. Adding new modes? Update the
+# helper `_driving_command_from_future` below.
+DRIVING_COMMAND_MODES = ("heading", "lateral")
+DEFAULT_DRIVING_COMMAND_MODE = "heading"
 
 
 def scene_dict_from_sample(
@@ -73,6 +83,8 @@ def scene_dict_from_sample(
     sample_token: str,
     num_future_frames: int = DEFAULT_NUM_FUTURE_FRAMES,
     driving_command_heading_deg: float = DEFAULT_DRIVING_COMMAND_HEADING_DEG,
+    driving_command_lateral_m: float = DEFAULT_DRIVING_COMMAND_LATERAL_M,
+    driving_command_mode: str = DEFAULT_DRIVING_COMMAND_MODE,
 ) -> Dict[str, Any]:
     """Convert a single TruckScenes sample into a navsim-compatible dict.
 
@@ -81,9 +93,16 @@ def scene_dict_from_sample(
     :param num_future_frames: future trajectory length used to derive
         driving_command. The sample must have at least this many `next`
         keyframes available; caller is responsible for filtering.
-    :param driving_command_heading_deg: |Δyaw| threshold (in degrees) that
-        decides STRAIGHT vs LEFT/RIGHT. Used only by the driving_command
-        derivation (heading mode).
+    :param driving_command_heading_deg: |Δyaw| threshold (degrees) that
+        decides STRAIGHT vs LEFT/RIGHT. Used only when
+        `driving_command_mode == "heading"`.
+    :param driving_command_lateral_m: |local_y| threshold (metres) at the
+        final future frame. Used only when
+        `driving_command_mode == "lateral"`.
+    :param driving_command_mode: one of `DRIVING_COMMAND_MODES`. "heading"
+        matches transfuser-truckscenes / nuPlan route-derived semantics.
+        "lateral" matches VAD's nuScenes converter and catches lane
+        changes.
     :return: dict with the schema documented at module top.
     """
     sample = ts.get("sample", sample_token)
@@ -116,15 +135,22 @@ def scene_dict_from_sample(
     anns = _build_annotations(ts, ref_sd, ego_pos, ego_yaw)
     extras = build_trailer_extras(sample, ts)
 
-    # driving_command derived from the future ego trajectory (heading mode).
-    # If the sample does not have enough future keyframes the helper raises
-    # so the caller knows it picked an invalid sample.
+    # driving_command derived from the future ego trajectory. Mode picks
+    # between heading (|Δyaw@4s|) and lateral (|local_y@4s|); see D10 in
+    # docs/paper_open_decisions.md.
+    if driving_command_mode not in DRIVING_COMMAND_MODES:
+        raise ValueError(
+            f"driving_command_mode={driving_command_mode!r} not in "
+            f"{DRIVING_COMMAND_MODES}"
+        )
     driving_command = _driving_command_from_future(
         ts,
         sample,
         ref_channel,
         num_future_frames=num_future_frames,
+        mode=driving_command_mode,
         heading_threshold_deg=driving_command_heading_deg,
+        lateral_threshold_m=driving_command_lateral_m,
     )
 
     # Scene-level identifiers required by `Scene.from_scene_dict_list`.
@@ -319,22 +345,38 @@ def _driving_command_from_future(
     sample,
     ref_channel,
     num_future_frames: int,
+    mode: str,
     heading_threshold_deg: float,
+    lateral_threshold_m: float,
 ) -> np.ndarray:
-    """Heading-mode driving_command. Mirrors transfuser-truckscenes
-    _get_driving_command (dataset.py:360-415).
+    """Derive a one-hot driving_command from the future ego trajectory.
 
-    Returns a (3,) one-hot int array in the order [Turn Right, Turn Left,
-    Go Straight]. Raises if the sample does not have `num_future_frames`
-    `next` keyframes; the caller must filter.
+    Two derivation modes (see docs/paper_open_decisions.md::D10):
+
+      * "heading" -- mirrors transfuser-truckscenes _get_driving_command
+        (dataset.py:360-415). Compares |Δyaw@N| to
+        `heading_threshold_deg`. Misses lane changes (small Δyaw, large
+        lateral offset).
+      * "lateral" -- mirrors VAD's nuScenes converter. Compares the
+        final-frame local y (lateral offset in the CURRENT ego frame)
+        to `lateral_threshold_m`. Catches lane changes; classifies
+        gradual curves as LEFT/RIGHT.
+
+    Returns a (3,) one-hot int array in the order [Turn Right, Turn
+    Left, Go Straight]. Falls back to STRAIGHT when the future chain
+    is shorter than `num_future_frames`.
     """
     sd_cur = ts.get("sample_data", sample["data"][ref_channel])
     ego_cur = ts.get("ego_pose", sd_cur["ego_pose_token"])
     current_yaw = _quaternion_to_yaw(ego_cur["rotation"])
+    current_pos = np.asarray(ego_cur["translation"][:2], dtype=np.float64)
 
+    # Walk forward up to N keyframes to find the latest ego pose. The
+    # loop tolerates short chains (e.g. last samples in a scene) and
+    # records the final valid yaw + global xy.
     next_token = sample.get("next", "")
-    final_yaw = current_yaw  # Falls back to "no change" if chain is short.
     last_valid_yaw = None
+    last_valid_pos = None
     for _ in range(num_future_frames):
         if not next_token:
             break
@@ -342,19 +384,38 @@ def _driving_command_from_future(
         next_sd = ts.get("sample_data", next_sample["data"][ref_channel])
         next_ego = ts.get("ego_pose", next_sd["ego_pose_token"])
         last_valid_yaw = _quaternion_to_yaw(next_ego["rotation"])
+        last_valid_pos = np.asarray(next_ego["translation"][:2], dtype=np.float64)
         next_token = next_sample.get("next", "")
-    if last_valid_yaw is not None:
-        final_yaw = last_valid_yaw
 
-    # Local heading delta at t = +N samples, normalized to [-pi, pi].
-    delta = (final_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
-    threshold = math.radians(heading_threshold_deg)
-    # One-hot order kept consistent with transfuser-truckscenes for parity
-    # with downstream NavSim code: [Turn Right, Turn Left, Go Straight].
-    # Positive delta (+yaw, left rotation in right-handed ego frame)
-    # corresponds to a LEFT action.
-    if delta >= threshold:
-        return np.array([0, 1, 0], dtype=np.int64)
-    if delta <= -threshold:
-        return np.array([1, 0, 0], dtype=np.int64)
-    return np.array([0, 0, 1], dtype=np.int64)
+    # One-hot order is fixed across modes for downstream parity:
+    # [Turn Right, Turn Left, Go Straight]. "Left" = positive lateral
+    # in the right-handed ego frame (same sign convention as Δyaw>0).
+    if mode == "heading":
+        if last_valid_yaw is None:
+            return np.array([0, 0, 1], dtype=np.int64)
+        delta = (last_valid_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
+        threshold = math.radians(heading_threshold_deg)
+        if delta >= threshold:
+            return np.array([0, 1, 0], dtype=np.int64)
+        if delta <= -threshold:
+            return np.array([1, 0, 0], dtype=np.int64)
+        return np.array([0, 0, 1], dtype=np.int64)
+
+    if mode == "lateral":
+        if last_valid_pos is None:
+            return np.array([0, 0, 1], dtype=np.int64)
+        # Rotate (last_pos - current_pos) into the CURRENT ego frame so
+        # local_y is lateral offset perpendicular to the ego heading at
+        # t=0. Same convention as `_estimate_ego_velocity` above.
+        dx = float(last_valid_pos[0] - current_pos[0])
+        dy = float(last_valid_pos[1] - current_pos[1])
+        cos_y, sin_y = math.cos(-current_yaw), math.sin(-current_yaw)
+        local_y = dx * sin_y + dy * cos_y
+        if local_y >= lateral_threshold_m:
+            return np.array([0, 1, 0], dtype=np.int64)
+        if local_y <= -lateral_threshold_m:
+            return np.array([1, 0, 0], dtype=np.int64)
+        return np.array([0, 0, 1], dtype=np.int64)
+
+    # Unreachable -- mode is validated by scene_dict_from_sample.
+    raise AssertionError(f"unhandled driving_command_mode={mode!r}")
