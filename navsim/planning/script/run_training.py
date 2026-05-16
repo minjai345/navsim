@@ -147,16 +147,22 @@ def main(cfg: DictConfig) -> None:
             tags=list(cfg.wandb.get("tags", []) or []),
             log_model=False,
         )
-    # Bump DDP rendezvous timeout from PyTorch's default 30 min. With
-    # force_cache_computation=true each rank rebuilds the feature cache
-    # independently, and the slower rank can arrive ~30-45 min after the
-    # faster one -- exceeding the default timeout and crashing rank 0
-    # before rank 1 finishes. 2 h covers our 17k-sample cache build with
-    # margin. Only applied when the yaml selects the bare string "ddp";
-    # other strategies (single_device, ddp_spawn, ...) pass through.
+    # Replace the bare "ddp" string with an explicit DDPStrategy to:
+    #   (1) bump the rendezvous timeout from 30 min to 2 h, since per-rank
+    #       cache build can take 30-45 min and the slower rank otherwise
+    #       trips DistStoreError on the faster rank.
+    #   (2) enable find_unused_parameters=True. Truck variants disable a
+    #       few heads (bev_semantic via weight=0, trailer head via flag,
+    #       semantic / depth aux heads) so some module parameters do not
+    #       receive gradients in a given step. DDP's strict mode crashes
+    #       on that pattern; this flag tells it to skip the unused ones.
+    # Other strategies (single_device, ddp_spawn, ...) pass through.
     trainer_params = dict(cfg.trainer.params)
     if trainer_params.get("strategy") == "ddp":
-        trainer_params["strategy"] = DDPStrategy(timeout=timedelta(hours=2))
+        trainer_params["strategy"] = DDPStrategy(
+            timeout=timedelta(hours=2),
+            find_unused_parameters=True,
+        )
     trainer = pl.Trainer(
         **trainer_params,
         callbacks=agent.get_training_callbacks(),
