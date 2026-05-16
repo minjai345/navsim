@@ -1,3 +1,4 @@
+from datetime import timedelta
 from typing import Tuple
 from pathlib import Path
 import logging
@@ -7,6 +8,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
+from pytorch_lightning.strategies import DDPStrategy
 
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import SceneFilter
@@ -145,8 +147,18 @@ def main(cfg: DictConfig) -> None:
             tags=list(cfg.wandb.get("tags", []) or []),
             log_model=False,
         )
+    # Bump DDP rendezvous timeout from PyTorch's default 30 min. With
+    # force_cache_computation=true each rank rebuilds the feature cache
+    # independently, and the slower rank can arrive ~30-45 min after the
+    # faster one -- exceeding the default timeout and crashing rank 0
+    # before rank 1 finishes. 2 h covers our 17k-sample cache build with
+    # margin. Only applied when the yaml selects the bare string "ddp";
+    # other strategies (single_device, ddp_spawn, ...) pass through.
+    trainer_params = dict(cfg.trainer.params)
+    if trainer_params.get("strategy") == "ddp":
+        trainer_params["strategy"] = DDPStrategy(timeout=timedelta(hours=2))
     trainer = pl.Trainer(
-        **cfg.trainer.params,
+        **trainer_params,
         callbacks=agent.get_training_callbacks(),
         logger=pl_loggers,
     )
