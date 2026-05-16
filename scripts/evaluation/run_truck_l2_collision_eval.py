@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import hydra
+import numpy as np
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -133,6 +134,10 @@ def main(cfg: DictConfig) -> None:
     # ---- main eval loop ----
     l2_per_sample: List[List[float]] = []
     col_per_sample: List[List[bool]] = []
+    # also retain (token, cmd_class) parallel arrays so the per-sample
+    # JSON can drive viz / per-class breakdowns later without re-running.
+    sample_tokens: List[str] = []
+    cmd_classes: List[int] = []
 
     for token in tqdm(val_tokens, desc="L2+col eval"):
         scene = val_scene_loader.get_scene_from_token(token)
@@ -162,12 +167,33 @@ def main(cfg: DictConfig) -> None:
         )
         l2_per_sample.append(l2_list)
         col_per_sample.append(col_list)
+        sample_tokens.append(token)
+        cmd_classes.append(int(np.argmax(agent_input.ego_statuses[-1].driving_command)))
 
     metrics = aggregate_metrics(l2_per_sample, col_per_sample, EVAL_HORIZONS)
 
     # ---- output ----
     out_json = output_dir / "l2_collision_metrics.json"
     out_json.write_text(json.dumps(metrics, indent=2))
+
+    # Per-sample dump for downstream consumers (viz pickers, ablation
+    # breakdowns by cmd class, statistical tests). Same horizon order as
+    # EVAL_HORIZONS.
+    per_sample_payload = {
+        "horizons_s": list(EVAL_HORIZONS),
+        "samples": [
+            {
+                "token": tok,
+                "cmd": cmd,
+                "l2_per_horizon": l2_per_sample[i],
+                "collision_per_horizon": [bool(x) for x in col_per_sample[i]],
+                "avg_l2": float(np.nanmean(l2_per_sample[i])),
+            }
+            for i, (tok, cmd) in enumerate(zip(sample_tokens, cmd_classes))
+        ],
+    }
+    out_per_sample = output_dir / "l2_collision_per_sample.json"
+    out_per_sample.write_text(json.dumps(per_sample_payload, indent=2))
 
     print()
     print("=== L2 + Collision evaluation ===")
@@ -182,7 +208,8 @@ def main(cfg: DictConfig) -> None:
     print("-" * 40)
     print(f"{'avg':<10}{metrics['l2/avg']:>12.3f}{metrics['col/avg']:>18.2f}")
     print()
-    print(f"JSON written to: {out_json}")
+    print(f"JSON written to:        {out_json}")
+    print(f"Per-sample JSON:        {out_per_sample}")
 
     if wandb_run is not None:
         wandb_run.summary.update(metrics)
