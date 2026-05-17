@@ -170,11 +170,27 @@ def main(cfg: DictConfig) -> None:
     )
 
     logger.info("Starting Training")
-    trainer.fit(
-        model=lightning_module,
-        train_dataloaders=train_dataloader,
-        val_dataloaders=val_dataloader,
-    )
+    try:
+        trainer.fit(
+            model=lightning_module,
+            train_dataloaders=train_dataloader,
+            val_dataloaders=val_dataloader,
+        )
+    finally:
+        # Explicit NCCL teardown. PyTorch Lightning's default DDP exit
+        # path leaks the process group (visible as
+        #   "WARNING: destroy_process_group() was not called before
+        #    program exit, which can leak resources."
+        # in our chain v4 β logs). On our B200 / Clunix container the
+        # leaked NCCL+CUDA state then breaks the next process's
+        # `torch.cuda.is_available()` and requires a container restart.
+        # Calling destroy_process_group() in a `finally` block ensures
+        # cleanup even when fit() raises -- the same path that left γ
+        # stuck on 2026-05-16.
+        import torch.distributed as _dist
+
+        if _dist.is_available() and _dist.is_initialized():
+            _dist.destroy_process_group()
 
 
 if __name__ == "__main__":
