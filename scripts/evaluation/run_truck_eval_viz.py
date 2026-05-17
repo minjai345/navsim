@@ -165,6 +165,16 @@ def main(cfg: DictConfig) -> None:
         sensor_config=agent.get_sensor_config(),
     )
     val_tokens = val_scene_loader.tokens
+    # Optional `+viz.score_subset=N` -- on CPU the full 2170-sample
+    # scoring pass takes ~1.5 h. When N is set we deterministically
+    # sample N tokens (random with fixed seed) and rank within that
+    # subset; the pick distribution is still meaningful for a preview.
+    score_subset = cfg.get("viz", {}).get("score_subset", None)
+    if score_subset is not None and score_subset > 0 and score_subset < len(val_tokens):
+        rng = random.Random(0)
+        val_tokens = rng.sample(list(val_tokens), int(score_subset))
+        logger.info("Subsetting to %d random val samples for fast scoring",
+                    len(val_tokens))
     logger.info("Scoring %d val samples to pick %d×3 viz samples",
                 len(val_tokens), num_per_cat)
 
