@@ -87,18 +87,31 @@ def _l2_per_horizon(pred: np.ndarray, gt: np.ndarray) -> List[float]:
 
 
 def _pick_samples(
-    summaries: List[Tuple[str, float, int]],
+    summaries: List[Tuple[str, float, int, float]],
     num_per_category: int,
+    min_gt_displacement_m: float = 2.0,
     seed: int = 0,
-) -> Dict[str, List[Tuple[str, float, int]]]:
+) -> Dict[str, List[Tuple[str, float, int, float]]]:
     """Pick `num_per_category` samples each of worst / best / random.
 
-    `summaries` is a list of (token, avg_l2, cmd_class).
+    Filters out near-stationary scenes (GT max displacement
+    < `min_gt_displacement_m`) so "best" L2≈0 doesn't trivially win on
+    parked-truck samples where pred-and-GT both predict no motion.
+
+    `summaries` entries are (token, avg_l2, cmd_class, gt_max_disp).
+    Returned tuples preserve the same shape for downstream consumers.
     """
-    sorted_by_l2 = sorted(summaries, key=lambda x: x[1], reverse=True)
+    active = [s for s in summaries if s[3] >= min_gt_displacement_m]
+    if not active:
+        # Should never happen on a real val split, but guard anyway.
+        active = summaries
+
+    sorted_by_l2 = sorted(active, key=lambda x: x[1], reverse=True)
     worst = sorted_by_l2[:num_per_category]
     best = sorted_by_l2[-num_per_category:][::-1]
-    middle = sorted_by_l2[num_per_category: max(num_per_category, len(sorted_by_l2) - num_per_category)]
+    middle = sorted_by_l2[
+        num_per_category: max(num_per_category, len(sorted_by_l2) - num_per_category)
+    ]
     rng = random.Random(seed)
     rand = rng.sample(middle, min(num_per_category, len(middle)))
     return {"worst": worst, "best": best, "random": rand}
@@ -125,6 +138,18 @@ def main(cfg: DictConfig) -> None:
     # Add "lidar" so the point cloud shows up alongside annotations.
     viz_config.BEV_PLOT_CONFIG["layers"] = ["annotations", "lidar"]
 
+    # Widen BEV extent: navsim default 64x64 m is too narrow for a 4-s
+    # truck trajectory at highway speed (~100 m forward). figure_margin
+    # = (margin_x_forward, margin_y_lateral) -- doubled by configure_bev_ax
+    # before applied as ±half. (160, 100) gives ±80 m forward × ±50 m lat.
+    viz_config.BEV_PLOT_CONFIG["figure_margin"] = (160, 100)
+
+    # Push LiDAR to the background. Defaults (alpha=0.5, size=0.1,
+    # zorder=3) drown annotations + trajectories. The shim's monkey-
+    # patched renderer already uses uniform light grey, so we just bump
+    # alpha/size/zorder via the shared config.
+    viz_config.LIDAR_CONFIG.update(alpha=0.20, size=0.05, zorder=1)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     agent: AbstractAgent = instantiate(cfg.agent)
     _load_checkpoint_into_agent(agent, ckpt_path)
@@ -144,7 +169,7 @@ def main(cfg: DictConfig) -> None:
                 len(val_tokens), num_per_cat)
 
     # ---- pass 1: score all val samples to rank by avg L2 ----
-    summaries: List[Tuple[str, float, int]] = []
+    summaries: List[Tuple[str, float, int, float]] = []
     for token in tqdm(val_tokens, desc="scoring"):
         scene = val_scene_loader.get_scene_from_token(token)
         agent_input = scene.get_agent_input()
@@ -161,7 +186,10 @@ def main(cfg: DictConfig) -> None:
         l2_list = _l2_per_horizon(pred_trajectory, gt_trajectory)
         avg_l2 = float(np.nanmean(l2_list))
         cmd = int(np.argmax(agent_input.ego_statuses[-1].driving_command))
-        summaries.append((token, avg_l2, cmd))
+        # max GT displacement from origin -- used to filter near-
+        # stationary samples (parked/stopped trucks where L2≈0 is trivial).
+        gt_max_disp = float(np.max(np.linalg.norm(gt_trajectory[:, :2], axis=-1)))
+        summaries.append((token, avg_l2, cmd, gt_max_disp))
 
     picks = _pick_samples(summaries, num_per_cat)
 
@@ -173,13 +201,13 @@ def main(cfg: DictConfig) -> None:
     for category, items in picks.items():
         cat_dir = viz_dir / category
         cat_dir.mkdir(exist_ok=True)
-        for token, avg_l2, cmd in items:
+        for token, avg_l2, cmd, gt_disp in items:
             scene = val_scene_loader.get_scene_from_token(token)
 
             fig, ax = plot_bev_with_agent(scene, agent)
             ax.set_title(
                 f"[{category}] cmd={CMD_LABELS.get(cmd, '?')}  "
-                f"avg L2={avg_l2:.2f} m\n{token}",
+                f"avg L2={avg_l2:.2f} m  gt_disp={gt_disp:.1f} m\n{token}",
                 fontsize=9,
             )
             fig.tight_layout()
@@ -190,9 +218,89 @@ def main(cfg: DictConfig) -> None:
 
     # picks.json for traceability.
     (viz_dir / "picks.json").write_text(json.dumps({
-        category: [{"token": t, "avg_l2": l, "cmd": c} for t, l, c in items]
+        category: [
+            {"token": t, "avg_l2": l, "cmd": c, "gt_disp_m": d}
+            for t, l, c, d in items
+        ]
         for category, items in picks.items()
     }, indent=2))
+
+    # ---- optional GIFs ----
+    # For each picked sample also render a short GIF that scrubs a
+    # "current-time" marker along the GT and predicted trajectories
+    # against the same BEV background. Useful for spotting where /
+    # when the prediction diverges from the human driver.
+    if bool(cfg.get("viz", {}).get("emit_gif", True)):
+        _emit_gifs(picks, val_scene_loader, agent, viz_dir, device)
+
+
+def _emit_gifs(picks, val_scene_loader, agent, viz_dir, device) -> None:
+    """Render one trajectory-scrub GIF per picked sample.
+
+    Each GIF: BEV background (annotations + lidar) drawn once, with a
+    large marker that walks step-by-step along the GT (green) and
+    predicted (red) trajectories. Saved next to the corresponding PNG
+    as `<token>.gif`. Uses Pillow directly since navsim's
+    frame_plot_to_gif expects a per-frame plot callable and we'd
+    re-render the whole BEV every frame -- much slower.
+    """
+    import io
+    from PIL import Image
+
+    for category, items in picks.items():
+        cat_dir = viz_dir / category
+        for token, avg_l2, cmd, gt_disp in items:
+            scene = val_scene_loader.get_scene_from_token(token)
+            agent_input = scene.get_agent_input()
+            gt_trajectory = scene.get_future_trajectory().poses
+            features = {}
+            for b in agent.get_feature_builders():
+                features.update(b.compute_features(agent_input))
+            features = {k: v.unsqueeze(0).to(device) for k, v in features.items()}
+            with torch.no_grad():
+                predictions = agent.forward(features)
+            pred_trajectory = (
+                predictions["trajectory"].squeeze(0).detach().cpu().numpy()
+            )
+
+            fig, ax = plot_bev_with_agent(scene, agent)
+            ax.set_title(
+                f"[{category}] cmd={CMD_LABELS.get(cmd, '?')}  "
+                f"avg L2={avg_l2:.2f} m  gt_disp={gt_disp:.1f} m\n{token}",
+                fontsize=9,
+            )
+
+            # The BEV ax uses (y, x) -> (x_screen, y_screen) per
+            # add_trajectory_to_bev_ax. Replicate that mapping for the
+            # animated marker.
+            gt_xy = np.concatenate([np.zeros((1, 2)), gt_trajectory[:, :2]], axis=0)
+            pr_xy = np.concatenate([np.zeros((1, 2)), pred_trajectory[:, :2]], axis=0)
+
+            # Persistent scatter handles -- updated in place each frame.
+            gt_marker = ax.scatter([], [], s=120, c="#2ca02c", edgecolors="black",
+                                   linewidths=1.2, zorder=6)
+            pr_marker = ax.scatter([], [], s=120, c="#d62728", edgecolors="black",
+                                   linewidths=1.2, zorder=6)
+
+            num_steps = min(gt_xy.shape[0], pr_xy.shape[0])
+            frames: List[Image.Image] = []
+            for k in range(num_steps):
+                # NOTE: matplotlib BEV plots y on x-screen and x on y-screen
+                # (see add_trajectory_to_bev_ax).
+                gt_marker.set_offsets([[gt_xy[k, 1], gt_xy[k, 0]]])
+                pr_marker.set_offsets([[pr_xy[k, 1], pr_xy[k, 0]]])
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", dpi=110)
+                buf.seek(0)
+                frames.append(Image.open(buf).copy())
+                buf.close()
+
+            plt.close(fig)
+            gif_path = cat_dir / f"{token}.gif"
+            frames[0].save(
+                gif_path, save_all=True, append_images=frames[1:],
+                duration=400, loop=0,
+            )
 
     print()
     print(f"Wrote {count} BEV PNG(s) under {viz_dir}/")
