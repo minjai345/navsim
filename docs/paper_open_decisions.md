@@ -274,6 +274,85 @@ Cons:
 **Decision plan:** train `truck_navsim_v9_bev48_seed0` (heading mode,
 BEV ±48), compare to v9 baseline (current). Pick the better.
 
+
+## D12. Trailer-load stratification -- "empty trailer" is yard, not road
+
+**Status:** resolved (2026-05-19, based on `tools/checks/check_dynamics_load_split.py`
+and visual inspection of all 22 empty-trailer scenes via
+`ts.render_sample`)
+
+The `scene_container_split.json` (built off median ego_trailer height
+≥ 2.5 m) divides the 464 with-trailer scenes into:
+
+  - **loaded** 442 scenes (median height ≥ 2.5 m -> container on
+    chassis), from many source recordings, normal road driving.
+  - **empty** 22 scenes (median height < 2.5 m -> chassis only).
+
+We originally planned to group `no_trailer` + `empty_trailer` as a
+"low-articulation" bin against `loaded_trailer` as "high-articulation"
+to study the trailer-load effect. But once we rendered every empty
+scene and ran a GT dynamics comparison, we found:
+
+**Empty trailer scenes are container-terminal / yard operations, not
+road driving.** All 22 originate from only **3 source recordings**
+(`scene-c1b21af2... -> 14 sub-scenes`, `scene-0044384a... -> 5`,
+`scene-b8e7da1b... -> 3`) — all of which depict the same kind of
+context: a tractor with bare-chassis trailer maneuvering around stacked
+shipping containers, gantry cranes, reach stackers, and yard workers.
+
+This shows up in the GT dynamics medians vs loaded scenes:
+
+| metric (median) | empty (yard) | loaded (road) | reading |
+|---|---|---|---|
+| \|hitch\| (deg) | 0.98 | 0.39 | yard truck parks at angle -> non-zero hitch |
+| \|dhitch/dt\| (deg/s) | **0.02** | 0.32 | yard truck idle -> rate ≈ 0 |
+| \|ay\| (m/s²) | 0.67 | 0.66 | only metric not confounded |
+| \|yaw rate\| (deg/s) | **0.00** | 0.30 | yard idle vs highway turning |
+
+i.e. three of the four "dynamics" differences are driven entirely by
+the **driving context** (yard vs road), not by the trailer load. The
+TruckScenes dataset has no road-driving samples of an empty trailer.
+
+For comparison, the 134 `no_trailer` scenes span 12 source recordings
+and are uniformly Autobahn-style highway footage (verified on 12
+random middle-sample renders).
+
+**Implications for the paper protocol:**
+
+  1. **"Trailer-load effect" cannot be isolated** with this dataset.
+     The empty bucket is confounded by being in a different operational
+     domain. Any L2 or PDMS gap between empty and loaded is mostly the
+     yard/road domain gap.
+
+  2. The "trailer-presence" axis (no_trailer vs loaded_trailer) IS
+     measurable -- both buckets are road driving -- and is what the
+     paper articulation comparison should use:
+       - **no_trailer**: tractor-only highway driving
+       - **loaded_trailer**: tractor + container highway driving
+
+  3. **Empty trailer is sanity-check / OOD only**, not a main result
+     axis. Possible appendix study: "Does the model handle yard
+     operations (OOD)?" Treat as out-of-distribution evaluation, not
+     as a low-articulation in-distribution comparison.
+
+  4. The original `low + high = no_trailer + empty vs loaded`
+     grouping in D2/D4 needs to be retired in favour of:
+        low-articulation = no_trailer
+        high-articulation = loaded_trailer
+
+**Counts (train / val) after this redefinition:**
+
+| group | train scenes | val scenes |
+|---|---|---|
+| no_trailer | 116 | 18 |
+| loaded_trailer | 388 | 54 |
+| empty (yard, excluded from main metric) | 19 | 3 |
+
+Cross-references:
+- Analysis script: `transfuser-truckscenes/tools/checks/check_dynamics_load_split.py`
+- Visual evidence: `transfuser-truckscenes/data/analysis/dynamics_load_split/empty_scenes/*.png` (all 22 rendered) and `.../no_trailer_scenes/*.png` (12 random renders).
+
+
 Active decision queue (chronological)
 
 | Order | Decision | Blocks |
