@@ -601,10 +601,6 @@ def _emit_gifs(picks, val_scene_loader, agent, viz_dir, device) -> None:
                 duration=400, loop=0,
             )
 
-    print()
-    print(f"Wrote {count} BEV PNG(s) under {viz_dir}/")
-    print("  (worst/, best/, random/ + picks.json)")
-
 
 if __name__ == "__main__":
     main()
