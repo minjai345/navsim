@@ -407,18 +407,32 @@ def main(cfg: DictConfig) -> None:
 
     picks = _pick_samples(summaries, num_per_cat)
 
-    # ---- pass 2: render picked samples via navsim plot_bev_with_agent ----
-    # Re-set the agent's compute_trajectory device to CPU temporarily would
-    # break our GPU acceleration; instead let plot_bev_with_agent call
-    # compute_trajectory which uses the agent's current device.
+    # ---- pass 2: render picked samples via navsim BEV helpers ----
+    # We cannot use `plot_bev_with_agent` directly because its internal
+    # `agent.compute_trajectory(...)` keeps features on CPU and would
+    # crash when the agent lives on GPU (CPU input vs GPU weights).
+    # Instead, compute the predicted trajectory manually with explicit
+    # device move and pass to `_render_bev_panel`.
     count = 0
     for category, items in picks.items():
         cat_dir = viz_dir / category
         cat_dir.mkdir(exist_ok=True)
         for token, avg_l2, cmd, gt_disp in items:
             scene = val_scene_loader.get_scene_from_token(token)
+            agent_input = scene.get_agent_input()
+            gt_trajectory = scene.get_future_trajectory().poses
+            features = {}
+            for b in agent.get_feature_builders():
+                features.update(b.compute_features(agent_input))
+            features = {k: v.unsqueeze(0).to(device) for k, v in features.items()}
+            with torch.no_grad():
+                predictions = agent.forward(features)
+            pred_trajectory = (
+                predictions["trajectory"].squeeze(0).detach().cpu().numpy()
+            )
 
-            fig, ax = plot_bev_with_agent(scene, agent)
+            fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+            _render_bev_panel(ax, scene, gt_trajectory, pred_trajectory)
             ax.set_title(
                 f"[{category}] cmd={CMD_LABELS.get(cmd, '?')}  "
                 f"avg L2={avg_l2:.2f} m  gt_disp={gt_disp:.1f} m\n{token}",
@@ -547,7 +561,8 @@ def _emit_gifs(picks, val_scene_loader, agent, viz_dir, device) -> None:
                 predictions["trajectory"].squeeze(0).detach().cpu().numpy()
             )
 
-            fig, ax = plot_bev_with_agent(scene, agent)
+            fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+            _render_bev_panel(ax, scene, gt_trajectory, pred_trajectory)
             ax.set_title(
                 f"[{category}] cmd={CMD_LABELS.get(cmd, '?')}  "
                 f"avg L2={avg_l2:.2f} m  gt_disp={gt_disp:.1f} m\n{token}",
