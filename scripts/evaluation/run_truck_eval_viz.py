@@ -328,6 +328,76 @@ def _render_composite_frame(
     )
 
 
+def _emit_composite_gif_rolling(
+    picked_sample_token: str,
+    sample_sequence: List[str],
+    viz_scene_loader,
+    agent,
+    device: torch.device,
+    out_path: Path,
+    title_prefix: str,
+    duration_ms: int = 400,
+) -> None:
+    """Render a rolling-prediction composite GIF.
+
+    At every GIF step k we *reload* the scene window centred on the k-th
+    sample in `sample_sequence` (samples within a TruckScenes scene are
+    spaced 0.5 s apart, matching our trajectory_sampling_interval), run
+    the agent on that window, and render the composite from its own
+    t=0 (= ego "now"). So the trajectory is the model's actual prediction
+    AT that step, not the t=0 prediction transformed -- everything
+    (cameras, BEV, GT/Pred polylines on cams + BEV) updates with the ego.
+    """
+    import io
+    from PIL import Image
+
+    fig = plt.figure(figsize=(14, 7))
+    frames = []
+    for k, sample_t in enumerate(sample_sequence):
+        scene_k = viz_scene_loader.get_scene_from_token(sample_t)
+        agent_input_k = scene_k.get_agent_input()
+        gt_traj_k = scene_k.get_future_trajectory().poses
+
+        features_k = {}
+        for b in agent.get_feature_builders():
+            features_k.update(b.compute_features(agent_input_k))
+        features_k = {kk: v.unsqueeze(0).to(device) for kk, v in features_k.items()}
+        with torch.no_grad():
+            preds_k = agent.forward(features_k)
+        pred_traj_k = preds_k["trajectory"].squeeze(0).detach().cpu().numpy()
+
+        # The Scene at step k has its own current frame = num_history-1;
+        # GT + Pred are already in THAT frame's ego coords.
+        current_idx = scene_k.scene_metadata.num_history_frames - 1
+        stats = [
+            f"{title_prefix}",
+            f"step k={k}  t=+{k * DEFAULT_INTERVAL_S:.1f}s",
+            f"sample={sample_t[:10]}…",
+        ]
+        _render_composite_frame(
+            fig=fig, grid_spec=None,
+            scene=scene_k,
+            frame_idx_for_cams=current_idx,
+            gt_trajectory_local=gt_traj_k,
+            pred_trajectory_local=pred_traj_k,
+            marker_idx=0,
+            stats_lines=stats,
+        )
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        buf.seek(0)
+        frames.append(Image.open(buf).copy())
+        buf.close()
+    plt.close(fig)
+
+    if not frames:
+        return
+    frames[0].save(
+        out_path, save_all=True, append_images=frames[1:],
+        duration=duration_ms, loop=0,
+    )
+
+
 def _emit_composite_gif(
     scene,
     gt_trajectory: np.ndarray,
@@ -641,6 +711,18 @@ def main(cfg: DictConfig) -> None:
             scene_filter=val_scene_filter,
             sensor_config=viz_sensor_config,
         )
+        # For rolling-prediction GIF, look up the next N consecutive
+        # sample-window tokens in the same scene. tokens_per_log gives
+        # {scene_token: [sample_token1, ...]} in chronological order.
+        tokens_per_log = viz_scene_loader.get_tokens_list_per_log()
+        sample_to_position: Dict[str, Tuple[str, int, List[str]]] = {}
+        for _log_name, _samps in tokens_per_log.items():
+            for _i, _st in enumerate(_samps):
+                sample_to_position[_st] = (_log_name, _i, _samps)
+        # 8 future steps = 4 s window, matches trajectory_sampling.
+        rolling_n_future = int(
+            cfg.get("viz", {}).get("rolling_n_future", 8) or 8
+        )
         # Sample-level curvy picker: ranks all val samples by |Δheading@4s|
         # (the GT future yaw change recorded in the scoring pass) and takes
         # the top-K. Avoids the scene_token / sample_token mismatch that
@@ -690,15 +772,33 @@ def main(cfg: DictConfig) -> None:
             fig.savefig(png_path, dpi=120, bbox_inches="tight")
             plt.close(fig)
 
-            # GIF: cameras advance per future frame, BEV stays at t=0
+            # GIF: rolling prediction -- at each future step k, build a
+            # fresh Scene window centred on the k-th consecutive sample,
+            # re-run the agent on that window, and render the composite
+            # from THAT window's t=0. Cameras, BEV, GT, and Pred all
+            # advance together; the prediction is the model's actual
+            # output at each step (not the t=0 prediction transformed).
             if bool(cfg.get("viz", {}).get("emit_gif", True)):
-                _emit_composite_gif(
-                    scene=scene,
-                    gt_trajectory=gt_trajectory,
-                    pred_trajectory=pred_trajectory,
-                    out_path=curvy_dir / f"{token}.gif",
-                    title_prefix=title_prefix,
-                )
+                pos = sample_to_position.get(token)
+                if pos is not None:
+                    _log_name, idx_in_scene, scene_samples = pos
+                    sequence = scene_samples[
+                        idx_in_scene: idx_in_scene + rolling_n_future + 1
+                    ]
+                    _emit_composite_gif_rolling(
+                        picked_sample_token=token,
+                        sample_sequence=sequence,
+                        viz_scene_loader=viz_scene_loader,
+                        agent=agent,
+                        device=device,
+                        out_path=curvy_dir / f"{token}.gif",
+                        title_prefix=title_prefix,
+                    )
+                else:
+                    logger.warning(
+                        "Curvy sample %s not in viz_scene_loader; "
+                        "skipping rolling GIF.", token,
+                    )
             curvy_records.append({
                 "token": token, "dheading_4s_deg": curvature,
                 "cmd": cmd, "avg_l2": avg_l2,
