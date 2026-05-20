@@ -476,23 +476,30 @@ def _emit_composite_gif(
     )
 
 
-def _curvy_picks_by_sample(
+def _curvy_picks_by_scene(
     summaries_with_curv: List[Tuple[str, float, int, float, float]],
+    sample_to_scene: Dict[str, str],
     top_k: int,
-) -> List[Tuple[str, float]]:
-    """Sample-level curvy picker.
+) -> List[Tuple[str, str, float]]:
+    """Scene-level curvy picker.
 
-    Sorts samples by |Δheading@4s| (in the GT future trajectory) descending
-    and returns the top-K (sample_token, abs_dheading_deg) pairs. This is
-    finer-grained than the scene-level scene_curvy_split.json: it pinpoints
-    the actual sample inside a scene where the truck is most actively
-    turning, which is what makes a useful "curvy" viz case.
-
-    Expected summary tuple layout:
-        (sample_token, avg_l2, cmd, gt_max_disp, abs_dheading_4s_deg)
+    For each scene, take the sample with the largest |Δheading@4s| as its
+    "peak" curvature, then rank scenes by that peak descending and take
+    the top-K. Returns (scene_token, peak_sample_token, peak_dheading_deg)
+    -- the peak sample serves as the anchor (and the filename stem), but
+    the rolling GIF replays the entire scene window.
     """
-    ranked = sorted(summaries_with_curv, key=lambda x: x[4], reverse=True)
-    return [(t, c) for (t, _l2, _cmd, _disp, c) in ranked[:top_k]]
+    scene_to_best: Dict[str, Tuple[str, float]] = {}
+    for sample_t, _l2, _cmd, _disp, dh in summaries_with_curv:
+        scene_t = sample_to_scene.get(sample_t)
+        if scene_t is None:
+            continue
+        if scene_t not in scene_to_best or scene_to_best[scene_t][1] < dh:
+            scene_to_best[scene_t] = (sample_t, dh)
+    sorted_scenes = sorted(
+        scene_to_best.items(), key=lambda x: x[1][1], reverse=True
+    )
+    return [(scene_t, info[0], info[1]) for scene_t, info in sorted_scenes[:top_k]]
 
 
 def _l2_per_horizon(pred: np.ndarray, gt: np.ndarray) -> List[float]:
@@ -719,24 +726,28 @@ def main(cfg: DictConfig) -> None:
         for _log_name, _samps in tokens_per_log.items():
             for _i, _st in enumerate(_samps):
                 sample_to_position[_st] = (_log_name, _i, _samps)
-        # 8 future steps = 4 s window, matches trajectory_sampling.
-        rolling_n_future = int(
-            cfg.get("viz", {}).get("rolling_n_future", 8) or 8
-        )
-        # Sample-level curvy picker: ranks all val samples by |Δheading@4s|
-        # (the GT future yaw change recorded in the scoring pass) and takes
-        # the top-K. Avoids the scene_token / sample_token mismatch that
-        # the JSON-based picker had, and pinpoints the actual sample where
-        # the truck is most actively turning.
-        curvy = _curvy_picks_by_sample(summaries, curvy_top_k)
-        logger.info("Curvy composite mode: %d samples selected", len(curvy))
+        # Scene-level curvy picker: groups val samples by scene, takes the
+        # peak |Δheading@4s| per scene as the scene's curvature score,
+        # and ranks scenes descending. Each pick yields one full-scene
+        # rolling-prediction GIF (all sample windows in that scene
+        # replayed in order). The "peak" sample inside the scene serves
+        # as the title anchor + filename stem.
+        sample_to_scene: Dict[str, str] = {
+            st: log for log, samps in tokens_per_log.items() for st in samps
+        }
+        curvy = _curvy_picks_by_scene(summaries, sample_to_scene, curvy_top_k)
+        logger.info("Curvy composite mode: %d scenes selected", len(curvy))
         curvy_records = []
-        for token, curvature in curvy:
-            # Use the viz-only SceneLoader so cameras + LiDAR are loaded
-            # at every frame (not just t=0); the agent-restricted loader
-            # masks future frames and the GIF cameras / BEV would go blank
-            # after frame 0.
-            scene = viz_scene_loader.get_scene_from_token(token)
+        for scene_token, peak_sample, peak_dh in curvy:
+            scene_samples = tokens_per_log.get(scene_token, [])
+            if not scene_samples:
+                logger.warning("Scene %s has 0 sample windows; skipping.",
+                               scene_token)
+                continue
+            # Render a static PNG centred on the peak sample (visual
+            # summary frame for the scene), then a full-scene rolling
+            # GIF that walks every sample window in chronological order.
+            scene = viz_scene_loader.get_scene_from_token(peak_sample)
             agent_input = scene.get_agent_input()
             gt_trajectory = scene.get_future_trajectory().poses
             features = {}
@@ -749,15 +760,15 @@ def main(cfg: DictConfig) -> None:
                 predictions["trajectory"].squeeze(0).detach().cpu().numpy()
             )
             cmd = int(np.argmax(agent_input.ego_statuses[-1].driving_command))
-            avg_l2 = float(np.nanmean(_l2_per_horizon(pred_trajectory, gt_trajectory)))
+            avg_l2 = float(
+                np.nanmean(_l2_per_horizon(pred_trajectory, gt_trajectory))
+            )
 
             title_prefix = (
                 f"cmd={CMD_LABELS.get(cmd, '?')}  "
-                f"|Δyaw@4s|={curvature:.1f}°  avg_L2={avg_l2:.2f} m  "
-                f"{token[:12]}…"
+                f"peak |Δyaw@4s|={peak_dh:.1f}°  peak L2={avg_l2:.2f} m  "
+                f"scene={scene_token[:12]}…"
             )
-            # static PNG: t=0 frame -- trajectories already in this
-            # frame's ego coords (scene.get_future_trajectory output).
             fig = plt.figure(figsize=(14, 7))
             _render_composite_frame(
                 fig=fig, grid_spec=None,
@@ -766,42 +777,28 @@ def main(cfg: DictConfig) -> None:
                 gt_trajectory_local=gt_trajectory,
                 pred_trajectory_local=pred_trajectory,
                 marker_idx=0,
-                stats_lines=[title_prefix, "t=+0.0s", "frame=current"],
+                stats_lines=[title_prefix, f"peak sample={peak_sample[:10]}…",
+                             f"scene length={len(scene_samples)} samples"],
             )
-            png_path = curvy_dir / f"{token}.png"
+            png_path = curvy_dir / f"{scene_token}.png"
             fig.savefig(png_path, dpi=120, bbox_inches="tight")
             plt.close(fig)
 
-            # GIF: rolling prediction -- at each future step k, build a
-            # fresh Scene window centred on the k-th consecutive sample,
-            # re-run the agent on that window, and render the composite
-            # from THAT window's t=0. Cameras, BEV, GT, and Pred all
-            # advance together; the prediction is the model's actual
-            # output at each step (not the t=0 prediction transformed).
             if bool(cfg.get("viz", {}).get("emit_gif", True)):
-                pos = sample_to_position.get(token)
-                if pos is not None:
-                    _log_name, idx_in_scene, scene_samples = pos
-                    sequence = scene_samples[
-                        idx_in_scene: idx_in_scene + rolling_n_future + 1
-                    ]
-                    _emit_composite_gif_rolling(
-                        picked_sample_token=token,
-                        sample_sequence=sequence,
-                        viz_scene_loader=viz_scene_loader,
-                        agent=agent,
-                        device=device,
-                        out_path=curvy_dir / f"{token}.gif",
-                        title_prefix=title_prefix,
-                    )
-                else:
-                    logger.warning(
-                        "Curvy sample %s not in viz_scene_loader; "
-                        "skipping rolling GIF.", token,
-                    )
+                _emit_composite_gif_rolling(
+                    picked_sample_token=peak_sample,
+                    sample_sequence=scene_samples,
+                    viz_scene_loader=viz_scene_loader,
+                    agent=agent,
+                    device=device,
+                    out_path=curvy_dir / f"{scene_token}.gif",
+                    title_prefix=title_prefix,
+                )
             curvy_records.append({
-                "token": token, "dheading_4s_deg": curvature,
-                "cmd": cmd, "avg_l2": avg_l2,
+                "scene_token": scene_token, "peak_sample": peak_sample,
+                "peak_dheading_4s_deg": peak_dh,
+                "peak_cmd": cmd, "peak_avg_l2": avg_l2,
+                "scene_length_samples": len(scene_samples),
             })
 
         (curvy_dir / "picks.json").write_text(
