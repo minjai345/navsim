@@ -527,15 +527,24 @@ def _scene_picks_by_load(
     container_split_json: Path,
     trailer_split_json: Path,
     scene_to_samples: Dict[str, List[Tuple[str, float, int, float, float]]],
-    mode: str,
+    load_group: str,
+    sort_mode: str,
     n: int,
     min_gt_disp_m: float = 2.0,
     seed: int = 0,
 ) -> List[Tuple[str, str, Dict[str, float]]]:
     """Pick scenes by trailer-load group (paper D12 grouping).
 
-    mode = "weighted"   -> with_container scenes (loaded trailer)
-    mode = "unweighted" -> without_ego_trailer scenes (no trailer at all)
+    `load_group`:
+      "weighted"   -> with_container scenes (loaded trailer)
+      "unweighted" -> without_ego_trailer scenes (no trailer at all)
+
+    `sort_mode`:
+      "worst"  -> sort by scene_avg_l2 descending (the picks the model
+                  fails most on inside the chosen load group). This is
+                  the most paper-useful mode: surfaces the failure cases
+                  conditioned on trailer presence.
+      "random" -> random pick (uniform within the load group).
 
     Per D12 the "empty_trailer" bucket (with_ego_trailer ∩ without_container)
     is intentionally excluded -- those scenes are container-terminal yard
@@ -548,9 +557,9 @@ def _scene_picks_by_load(
     without_trailer = {s["token"] for s in trailer_data["without_ego_trailer"]["scenes"]}
 
     val_scenes = set(scene_to_samples.keys())
-    if mode == "weighted":
+    if load_group == "weighted":
         candidate = val_scenes & with_container
-    elif mode == "unweighted":
+    elif load_group == "unweighted":
         candidate = val_scenes & without_trailer
     else:
         return []
@@ -567,10 +576,20 @@ def _scene_picks_by_load(
             "scene_avg_l2": round(avg_l2, 3),
             "peak_sample_l2": round(float(peak_sample[1]), 3),
             "n_active_samples": len(active),
-            "load_group": mode,
+            "load_group": load_group,
         }))
-    rng = random.Random(seed)
-    return rng.sample(items, min(n, len(items)))
+    if not items:
+        return []
+    if sort_mode == "worst":
+        items.sort(key=lambda x: x[2]["scene_avg_l2"], reverse=True)
+        return items[:n]
+    if sort_mode == "best":
+        items.sort(key=lambda x: x[2]["scene_avg_l2"])
+        return items[:n]
+    if sort_mode == "random":
+        rng = random.Random(seed)
+        return rng.sample(items, min(n, len(items)))
+    return []
 
 
 def _render_one_scene_pick(
@@ -843,12 +862,17 @@ def main(cfg: DictConfig) -> None:
     # `+viz.num_per_category=N` for {worst, best, random}.
     legacy_n = int(cfg.get("viz", {}).get("num_per_category", 0) or 0)
     category_n = {
-        "worst":      int(cfg.get("viz", {}).get("worst",      legacy_n or 3)),
-        "best":       int(cfg.get("viz", {}).get("best",       legacy_n or 3)),
-        "random":     int(cfg.get("viz", {}).get("random",     legacy_n or 3)),
-        "curvy":      int(cfg.get("viz", {}).get("curvy_top_k", 0) or 0),
-        "weighted":   int(cfg.get("viz", {}).get("weighted",   0) or 0),
-        "unweighted": int(cfg.get("viz", {}).get("unweighted", 0) or 0),
+        "worst":             int(cfg.get("viz", {}).get("worst",             legacy_n or 3)),
+        "best":              int(cfg.get("viz", {}).get("best",              legacy_n or 3)),
+        "random":            int(cfg.get("viz", {}).get("random",            legacy_n or 3)),
+        "curvy":             int(cfg.get("viz", {}).get("curvy_top_k",       0) or 0),
+        # Trailer-load conditioned picks (paper D12 axis). `_worst` =
+        # scenes the model fails most on inside that load group;
+        # `_random` = a baseline uniform sample inside the group.
+        "weighted_worst":    int(cfg.get("viz", {}).get("weighted_worst",    0) or 0),
+        "weighted_random":   int(cfg.get("viz", {}).get("weighted_random",   0) or 0),
+        "unweighted_worst":  int(cfg.get("viz", {}).get("unweighted_worst",  0) or 0),
+        "unweighted_random": int(cfg.get("viz", {}).get("unweighted_random", 0) or 0),
     }
     container_json = cfg.get("viz", {}).get(
         "container_split_json", "data/analysis/scene_container_split.json"
@@ -878,16 +902,15 @@ def main(cfg: DictConfig) -> None:
                 summaries, sample_to_scene, category_n["curvy"]
             )
         ]
-    if category_n["weighted"] > 0:
-        picks_by_category["weighted"] = _scene_picks_by_load(
-            Path(container_json), Path(trailer_json),
-            scene_to_samples, "weighted", category_n["weighted"]
-        )
-    if category_n["unweighted"] > 0:
-        picks_by_category["unweighted"] = _scene_picks_by_load(
-            Path(container_json), Path(trailer_json),
-            scene_to_samples, "unweighted", category_n["unweighted"]
-        )
+    for load_group in ("weighted", "unweighted"):
+        for sort_mode in ("worst", "random"):
+            key = f"{load_group}_{sort_mode}"
+            n_here = category_n[key]
+            if n_here > 0:
+                picks_by_category[key] = _scene_picks_by_load(
+                    Path(container_json), Path(trailer_json),
+                    scene_to_samples, load_group, sort_mode, n_here,
+                )
 
     # Render each category through the unified scene-pick renderer.
     all_records: Dict[str, List[Dict]] = {}
