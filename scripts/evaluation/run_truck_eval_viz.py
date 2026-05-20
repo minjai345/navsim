@@ -88,21 +88,149 @@ def _render_bev_panel(
     scene,
     gt_trajectory: np.ndarray,
     pred_trajectory: np.ndarray,
+    frame_idx: int = None,
 ) -> None:
     """Fill one matplotlib axis with the BEV (annotations + lidar) + GT/Pred
     trajectories. Same content as plot_bev_with_agent but writes to a given
-    ax instead of creating its own figure. Lets us drop the BEV into a
-    composite grid alongside the camera panels.
+    ax instead of creating its own figure, and lets the caller pick the
+    frame index whose ego pose is treated as the BEV origin.
+
+    `gt_trajectory` and `pred_trajectory` MUST already be expressed in
+    that frame's ego coordinates.
     """
     from navsim.visualization.config import TRAJECTORY_CONFIG
     from navsim.common.dataclasses import Trajectory
 
-    frame_idx = scene.scene_metadata.num_history_frames - 1
+    if frame_idx is None:
+        frame_idx = scene.scene_metadata.num_history_frames - 1
     add_configured_bev_on_ax(ax, scene.map_api, scene.frames[frame_idx])
     add_trajectory_to_bev_ax(ax, Trajectory(gt_trajectory), TRAJECTORY_CONFIG["human"])
     add_trajectory_to_bev_ax(ax, Trajectory(pred_trajectory), TRAJECTORY_CONFIG["agent"])
     configure_bev_ax(ax)
     configure_ax(ax)
+
+
+def _local_to_global_se2(
+    local_poses: np.ndarray, origin_se2: np.ndarray
+) -> np.ndarray:
+    """Apply SE2 forward transform: poses in a local frame -> global frame.
+
+    `origin_se2`: shape (3,), the local frame's origin in global coords
+        as (x, y, heading).
+    `local_poses`: shape (N, 3), each row (x, y, heading) in local coords.
+    Returns: shape (N, 3) in global coords.
+
+    Mirrors the inverse of `convert_absolute_to_relative_se2_array` used
+    throughout navsim's trajectory helpers.
+    """
+    cos_h = float(np.cos(origin_se2[2]))
+    sin_h = float(np.sin(origin_se2[2]))
+    x_g = origin_se2[0] + local_poses[:, 0] * cos_h - local_poses[:, 1] * sin_h
+    y_g = origin_se2[1] + local_poses[:, 0] * sin_h + local_poses[:, 1] * cos_h
+    h_g = origin_se2[2] + local_poses[:, 2]
+    return np.stack([x_g, y_g, h_g], axis=-1)
+
+
+def _project_ego_xy_to_image(
+    xy_in_ego: np.ndarray,
+    camera,
+    z_ground: float = 0.0,
+    eps: float = 1e-3,
+):
+    """Project a polyline of (x, y) ego-frame ground points onto the camera
+    image. Returns (pixels_xy, in_fov_mask) parallel arrays.
+
+    Same projection pipeline as navsim's `_transform_pcs_to_images`
+    (ego = lidar frame in our convention; the camera carries
+    sensor2lidar_rotation / sensor2lidar_translation that map camera-frame
+    points to ego/lidar-frame -- inverted here to take ego -> camera).
+    `z_ground` is the assumed elevation of the trajectory; 0.0 puts the
+    line on the (rear-axle, lidar-origin) ground plane.
+    """
+    if xy_in_ego.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=bool)
+
+    # Build (N, 4) homogeneous points at z_ground.
+    n = xy_in_ego.shape[0]
+    pts_ego = np.concatenate(
+        [
+            np.asarray(xy_in_ego[:, :2], dtype=np.float64),
+            np.full((n, 1), float(z_ground), dtype=np.float64),
+            np.ones((n, 1), dtype=np.float64),
+        ],
+        axis=-1,
+    )
+
+    # ego -> camera via inverse of sensor2lidar (sensor==camera, lidar==ego).
+    sensor2lidar_r = np.asarray(camera.sensor2lidar_rotation, dtype=np.float64)
+    sensor2lidar_t = np.asarray(camera.sensor2lidar_translation, dtype=np.float64)
+    lidar2cam_r = np.linalg.inv(sensor2lidar_r)
+    lidar2cam_t = sensor2lidar_t @ lidar2cam_r.T
+    lidar2cam_rt = np.eye(4)
+    lidar2cam_rt[:3, :3] = lidar2cam_r.T
+    lidar2cam_rt[3, :3] = -lidar2cam_t
+
+    intrinsic = np.asarray(camera.intrinsics, dtype=np.float64)
+    viewpad = np.eye(4)
+    viewpad[: intrinsic.shape[0], : intrinsic.shape[1]] = intrinsic
+    lidar2img_rt = viewpad @ lidar2cam_rt.T
+
+    pts_cam = (lidar2img_rt @ pts_ego.T).T
+    in_front_mask = pts_cam[:, 2] > eps
+    pts_2d = pts_cam[:, :2] / np.maximum(
+        pts_cam[:, 2:3], np.ones_like(pts_cam[:, 2:3]) * eps
+    )
+    return pts_2d, in_front_mask
+
+
+def _draw_trajectory_on_image_ax(
+    ax,
+    image,
+    traj_xy_ego: np.ndarray,
+    camera,
+    color: str,
+    linewidth: float = 2.5,
+    marker_size: float = 18,
+) -> None:
+    """Plot a projected trajectory polyline (+ point markers) onto a given
+    ax that already has the camera image rendered. Points outside the
+    image frustum are dropped.
+    """
+    pix, in_fov = _project_ego_xy_to_image(traj_xy_ego, camera)
+    if pix.shape[0] == 0 or not in_fov.any():
+        return
+    h, w = image.shape[:2]
+    in_bounds = (
+        in_fov
+        & (pix[:, 0] >= 0) & (pix[:, 0] < w)
+        & (pix[:, 1] >= 0) & (pix[:, 1] < h)
+    )
+    if not in_bounds.any():
+        return
+    visible = pix[in_bounds]
+    ax.plot(visible[:, 0], visible[:, 1], "-", color=color, linewidth=linewidth)
+    ax.scatter(visible[:, 0], visible[:, 1], s=marker_size,
+               c=color, edgecolors="black", linewidths=0.6, zorder=4)
+
+
+def _trajectory_in_frame(
+    traj_global: np.ndarray,
+    target_frame_origin_se2: np.ndarray,
+) -> np.ndarray:
+    """Re-express a global trajectory in the local frame of `target`.
+
+    Wrapper around navsim's convert_absolute_to_relative_se2_array.
+    """
+    from nuplan.common.actor_state.state_representation import StateSE2
+    from navsim.planning.simulation.planner.pdm_planner.utils.pdm_geometry_utils import (
+        convert_absolute_to_relative_se2_array,
+    )
+    origin = StateSE2(
+        float(target_frame_origin_se2[0]),
+        float(target_frame_origin_se2[1]),
+        float(target_frame_origin_se2[2]),
+    )
+    return convert_absolute_to_relative_se2_array(origin, traj_global.astype(np.float64))
 
 
 # Map our 4-cam TruckScenes layout to a 2x2 grid: top row = front, bottom = back.
@@ -120,8 +248,8 @@ def _render_composite_frame(
     grid_spec,
     scene,
     frame_idx_for_cams: int,
-    gt_trajectory_t0: np.ndarray,
-    pred_trajectory_t0: np.ndarray,
+    gt_trajectory_local: np.ndarray,
+    pred_trajectory_local: np.ndarray,
     marker_idx: int,
     stats_lines: List[str],
 ) -> None:
@@ -156,6 +284,18 @@ def _render_composite_frame(
         camera = getattr(frame.cameras, cam_attr, None)
         if camera is not None and getattr(camera, "image", None) is not None:
             add_camera_ax(ax, camera)
+            # Overlay GT (green) and Pred (red) trajectories projected
+            # into image coords. Trajectories arrive in this frame's
+            # ego coords; the camera carries sensor2lidar (= sensor2ego)
+            # extrinsics + intrinsics, see `_project_ego_xy_to_image`.
+            _draw_trajectory_on_image_ax(
+                ax, camera.image, gt_trajectory_local[:, :2], camera,
+                color="#2ca02c",
+            )
+            _draw_trajectory_on_image_ax(
+                ax, camera.image, pred_trajectory_local[:, :2], camera,
+                color="#d62728",
+            )
         else:
             ax.set_facecolor("#222")
             ax.text(0.5, 0.5, "no image", color="white",
@@ -166,25 +306,17 @@ def _render_composite_frame(
         ax.set_yticks([])
 
     # ---- BEV panel ----
+    # BEV is rendered from `frame_idx_for_cams` perspective: LiDAR +
+    # annotations come from that frame, trajectories are expressed in
+    # that frame's ego coords (so they curve away from the ego origin
+    # which is now centered on whichever future point in time the GIF
+    # is at). marker_idx is no longer needed -- the ego itself sits at
+    # the BEV origin at every step.
     bev_ax = fig.add_subplot(gs[0:2, 1])
-    _render_bev_panel(bev_ax, scene, gt_trajectory_t0, pred_trajectory_t0)
-
-    # Trajectory progress markers (BEV axes convention: y_world plotted on
-    # x-screen, x_world on y-screen, x-axis inverted -- mirrors
-    # add_trajectory_to_bev_ax).
-    gt_xy = np.concatenate(
-        [np.zeros((1, 2)), gt_trajectory_t0[:, :2]], axis=0
+    _render_bev_panel(
+        bev_ax, scene, gt_trajectory_local, pred_trajectory_local,
+        frame_idx=frame_idx_for_cams,
     )
-    pr_xy = np.concatenate(
-        [np.zeros((1, 2)), pred_trajectory_t0[:, :2]], axis=0
-    )
-    k = max(0, min(marker_idx, gt_xy.shape[0] - 1, pr_xy.shape[0] - 1))
-    bev_ax.scatter([gt_xy[k, 1]], [gt_xy[k, 0]],
-                   s=120, c="#2ca02c", edgecolors="black",
-                   linewidths=1.2, zorder=6)
-    bev_ax.scatter([pr_xy[k, 1]], [pr_xy[k, 0]],
-                   s=120, c="#d62728", edgecolors="black",
-                   linewidths=1.2, zorder=6)
 
     # ---- stats banner (bottom row spanning all 3 cols) ----
     stats_ax = fig.add_subplot(gs[2, :])
@@ -204,31 +336,48 @@ def _emit_composite_gif(
     title_prefix: str,
     duration_ms: int = 400,
 ) -> None:
-    """Render a 2x3 composite GIF.
+    """Render a 2x3 composite GIF where everything advances with the ego.
 
     Each GIF frame `k` (k = 0..num_future_frames):
       * cameras come from `scene.frames[num_history-1 + k]`
         -> the 4 camera views actually advance through time
-      * BEV(t=0) stays fixed (LiDAR + annotations at the starting frame)
-      * GT and predicted markers scrub along their trajectories at step k
+      * BEV is rendered from THAT frame's ego origin (LiDAR + annotations
+        from scene.frames[num_history-1 + k])
+      * GT and predicted trajectories are re-expressed in that frame's
+        ego coords (computed once in global, transformed per frame)
+      * Both trajectories are also overlaid as polylines on the 4 cams
 
-    Cameras updating means you see the road change as the truck moves;
-    BEV stays fixed so the two trajectories remain visible end-to-end
-    (paper-style trajectory comparison).
+    All three (cameras, LiDAR/BEV, trajectory) update consistently, so
+    the GIF reads as "ego POV advancing forward in time".
     """
     import io
     from PIL import Image
 
     num_history = scene.scene_metadata.num_history_frames
     num_future = scene.scene_metadata.num_future_frames
-    # GIF spans the current frame + num_future_frames forward poses, so
-    # camera frames and trajectory marker step together.
-    n_steps = min(num_future + 1, gt_trajectory.shape[0] + 1, pred_trajectory.shape[0] + 1)
+    n_steps = min(num_future + 1, gt_trajectory.shape[0] + 1,
+                  pred_trajectory.shape[0] + 1)
+
+    # Pre-compute trajectories in GLOBAL coords once. gt_trajectory and
+    # pred_trajectory arrive in t=0 ego frame; lift them out via the
+    # t=0 ego global pose stored on the current frame, then on each
+    # GIF step we collapse back into that step's ego frame.
+    t0_ego_global = np.asarray(
+        scene.frames[num_history - 1].ego_status.ego_pose, dtype=np.float64
+    )
+    gt_global = _local_to_global_se2(gt_trajectory, t0_ego_global)
+    pred_global = _local_to_global_se2(pred_trajectory, t0_ego_global)
 
     fig = plt.figure(figsize=(14, 7))
     frames = []
     for k in range(n_steps):
         frame_idx_for_cams = min(num_history - 1 + k, len(scene.frames) - 1)
+        frame_ego_global = np.asarray(
+            scene.frames[frame_idx_for_cams].ego_status.ego_pose, dtype=np.float64
+        )
+        gt_in_frame = _trajectory_in_frame(gt_global, frame_ego_global)
+        pred_in_frame = _trajectory_in_frame(pred_global, frame_ego_global)
+
         stats = [
             f"{title_prefix}",
             f"t=+{k * DEFAULT_INTERVAL_S:.1f}s",
@@ -239,8 +388,8 @@ def _emit_composite_gif(
             grid_spec=None,
             scene=scene,
             frame_idx_for_cams=frame_idx_for_cams,
-            gt_trajectory_t0=gt_trajectory,
-            pred_trajectory_t0=pred_trajectory,
+            gt_trajectory_local=gt_in_frame,
+            pred_trajectory_local=pred_in_frame,
             marker_idx=k,
             stats_lines=stats,
         )
@@ -472,6 +621,26 @@ def main(cfg: DictConfig) -> None:
     if curvy_top_k > 0:
         curvy_dir = viz_dir / "curvy_composite"
         curvy_dir.mkdir(exist_ok=True)
+        # The training SceneLoader masks cameras to `cam_*=[3]` (only the
+        # current t=0 frame), so scene.frames[future_idx].cameras.cam_l0
+        # is None at all future indices and the GIF cameras show "no
+        # image". For composite GIFs we need cameras at every frame, so
+        # build a viz-only SceneLoader with the 4 used cams enabled at
+        # ALL iterations (True). The 4 unused slots stay False to avoid
+        # the Cameras.from_camera_dict NoneType subscript crash we hit
+        # back in the Phase C iter 2 bug.
+        from navsim.common.dataclasses import SensorConfig as _SensorConfig
+        viz_sensor_config = _SensorConfig(
+            cam_f0=False, cam_l1=False, cam_r1=False, cam_b0=False,
+            cam_l0=True, cam_r0=True, cam_l2=True, cam_r2=True,
+            lidar_pc=True,
+        )
+        viz_scene_loader = SceneLoader(
+            sensor_blobs_path=Path(cfg.sensor_blobs_path),
+            data_path=Path(cfg.navsim_log_path),
+            scene_filter=val_scene_filter,
+            sensor_config=viz_sensor_config,
+        )
         # Sample-level curvy picker: ranks all val samples by |Δheading@4s|
         # (the GT future yaw change recorded in the scoring pass) and takes
         # the top-K. Avoids the scene_token / sample_token mismatch that
@@ -501,14 +670,15 @@ def main(cfg: DictConfig) -> None:
                 f"|Δyaw@4s|={curvature:.1f}°  avg_L2={avg_l2:.2f} m  "
                 f"{token[:12]}…"
             )
-            # static PNG: t=0 frame
+            # static PNG: t=0 frame -- trajectories already in this
+            # frame's ego coords (scene.get_future_trajectory output).
             fig = plt.figure(figsize=(14, 7))
             _render_composite_frame(
                 fig=fig, grid_spec=None,
                 scene=scene,
                 frame_idx_for_cams=scene.scene_metadata.num_history_frames - 1,
-                gt_trajectory_t0=gt_trajectory,
-                pred_trajectory_t0=pred_trajectory,
+                gt_trajectory_local=gt_trajectory,
+                pred_trajectory_local=pred_trajectory,
                 marker_idx=0,
                 stats_lines=[title_prefix, "t=+0.0s", "frame=current"],
             )
