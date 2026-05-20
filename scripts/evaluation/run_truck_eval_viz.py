@@ -476,6 +476,179 @@ def _emit_composite_gif(
     )
 
 
+def _scene_picks_by_l2(
+    scene_to_samples: Dict[str, List[Tuple[str, float, int, float, float]]],
+    mode: str,
+    n: int,
+    min_gt_disp_m: float = 2.0,
+    seed: int = 0,
+) -> List[Tuple[str, str, Dict[str, float]]]:
+    """worst / best / random scene picks by per-scene avg L2.
+
+    Aggregates each scene's "active" (non-stationary, gt_disp >= 2 m)
+    samples to a single avg L2 number, then picks the worst (high L2),
+    best (low L2), or random scenes.
+
+    Returns list of (scene_token, peak_sample_token, meta_dict). The
+    peak sample is the sample with the highest L2 inside the scene -- a
+    natural anchor for the static composite PNG.
+    """
+    items: List[Tuple[str, str, Dict[str, float]]] = []
+    for scene_t, samples_summary in scene_to_samples.items():
+        active = [s for s in samples_summary if s[3] >= min_gt_disp_m]
+        if not active:
+            continue
+        peak_sample = max(active, key=lambda s: s[1])
+        avg_l2 = float(np.mean([s[1] for s in active]))
+        items.append((scene_t, peak_sample[0], {
+            "scene_avg_l2": round(avg_l2, 3),
+            "peak_sample_l2": round(float(peak_sample[1]), 3),
+            "n_active_samples": len(active),
+        }))
+    if not items:
+        return []
+    if mode == "worst":
+        items.sort(key=lambda x: x[2]["scene_avg_l2"], reverse=True)
+        return items[:n]
+    if mode == "best":
+        items.sort(key=lambda x: x[2]["scene_avg_l2"])
+        return items[:n]
+    if mode == "random":
+        # exclude both tails to keep the random pick "average-difficulty".
+        items.sort(key=lambda x: x[2]["scene_avg_l2"])
+        trim = max(1, n)
+        middle = items[trim: max(trim, len(items) - trim)]
+        rng = random.Random(seed)
+        return rng.sample(middle, min(n, len(middle)))
+    return []
+
+
+def _scene_picks_by_load(
+    container_split_json: Path,
+    trailer_split_json: Path,
+    scene_to_samples: Dict[str, List[Tuple[str, float, int, float, float]]],
+    mode: str,
+    n: int,
+    min_gt_disp_m: float = 2.0,
+    seed: int = 0,
+) -> List[Tuple[str, str, Dict[str, float]]]:
+    """Pick scenes by trailer-load group (paper D12 grouping).
+
+    mode = "weighted"   -> with_container scenes (loaded trailer)
+    mode = "unweighted" -> without_ego_trailer scenes (no trailer at all)
+
+    Per D12 the "empty_trailer" bucket (with_ego_trailer ∩ without_container)
+    is intentionally excluded -- those scenes are container-terminal yard
+    operations, not road driving, and conflate trailer load with driving
+    context.
+    """
+    container_data = json.loads(Path(container_split_json).read_text())
+    trailer_data = json.loads(Path(trailer_split_json).read_text())
+    with_container = {s["token"] for s in container_data["with_container"]["scenes"]}
+    without_trailer = {s["token"] for s in trailer_data["without_ego_trailer"]["scenes"]}
+
+    val_scenes = set(scene_to_samples.keys())
+    if mode == "weighted":
+        candidate = val_scenes & with_container
+    elif mode == "unweighted":
+        candidate = val_scenes & without_trailer
+    else:
+        return []
+
+    items: List[Tuple[str, str, Dict[str, float]]] = []
+    for scene_t in candidate:
+        samples_summary = scene_to_samples[scene_t]
+        active = [s for s in samples_summary if s[3] >= min_gt_disp_m]
+        if not active:
+            continue
+        peak_sample = max(active, key=lambda s: s[1])
+        avg_l2 = float(np.mean([s[1] for s in active]))
+        items.append((scene_t, peak_sample[0], {
+            "scene_avg_l2": round(avg_l2, 3),
+            "peak_sample_l2": round(float(peak_sample[1]), 3),
+            "n_active_samples": len(active),
+            "load_group": mode,
+        }))
+    rng = random.Random(seed)
+    return rng.sample(items, min(n, len(items)))
+
+
+def _render_one_scene_pick(
+    scene_token: str,
+    peak_sample_token: str,
+    scene_samples: List[str],
+    viz_scene_loader,
+    agent,
+    device: torch.device,
+    out_dir: Path,
+    category: str,
+    meta_dict: Dict,
+    emit_gif: bool = True,
+) -> Dict:
+    """Render a single scene pick: static PNG + full-scene rolling GIF.
+
+    Returns the extended meta dict for picks.json. The static PNG is
+    centred on `peak_sample_token` (which the caller usually picks as
+    the sample with the most "interesting" L2 / |Δyaw| inside the
+    scene). The GIF replays every sample window in `scene_samples`
+    chronologically through `_emit_composite_gif_rolling`.
+    """
+    peak_scene = viz_scene_loader.get_scene_from_token(peak_sample_token)
+    agent_input = peak_scene.get_agent_input()
+    gt_trajectory = peak_scene.get_future_trajectory().poses
+    features = {}
+    for b in agent.get_feature_builders():
+        features.update(b.compute_features(agent_input))
+    features = {k: v.unsqueeze(0).to(device) for k, v in features.items()}
+    with torch.no_grad():
+        predictions = agent.forward(features)
+    pred_trajectory = predictions["trajectory"].squeeze(0).detach().cpu().numpy()
+    cmd = int(np.argmax(agent_input.ego_statuses[-1].driving_command))
+
+    # Concise title: include the most informative meta fields up front.
+    meta_bits = [f"[{category}]", f"cmd={CMD_LABELS.get(cmd, '?')}"]
+    for k_, v_ in meta_dict.items():
+        if k_ in ("scene_avg_l2", "peak_sample_l2", "peak_dheading_4s_deg"):
+            meta_bits.append(f"{k_}={v_}")
+    title_prefix = "  ".join(meta_bits) + f"  scene={scene_token[:12]}…"
+
+    fig = plt.figure(figsize=(14, 7))
+    _render_composite_frame(
+        fig=fig, grid_spec=None,
+        scene=peak_scene,
+        frame_idx_for_cams=peak_scene.scene_metadata.num_history_frames - 1,
+        gt_trajectory_local=gt_trajectory,
+        pred_trajectory_local=pred_trajectory,
+        marker_idx=0,
+        stats_lines=[
+            title_prefix,
+            f"peak sample={peak_sample_token[:10]}…",
+            f"scene length={len(scene_samples)} samples",
+        ],
+    )
+    fig.savefig(out_dir / f"{scene_token}.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+    if emit_gif:
+        _emit_composite_gif_rolling(
+            picked_sample_token=peak_sample_token,
+            sample_sequence=scene_samples,
+            viz_scene_loader=viz_scene_loader,
+            agent=agent,
+            device=device,
+            out_path=out_dir / f"{scene_token}.gif",
+            title_prefix=title_prefix,
+        )
+
+    return {
+        "scene_token": scene_token,
+        "peak_sample": peak_sample_token,
+        "peak_cmd": cmd,
+        "scene_length_samples": len(scene_samples),
+        **meta_dict,
+    }
+
+
 def _curvy_picks_by_scene(
     summaries_with_curv: List[Tuple[str, float, int, float, float]],
     sample_to_scene: Dict[str, str],
@@ -633,177 +806,124 @@ def main(cfg: DictConfig) -> None:
         dheading_4s_deg = float(np.degrees(abs(gt_trajectory[-1, 2])))
         summaries.append((token, avg_l2, cmd, gt_max_disp, dheading_4s_deg))
 
-    picks = _pick_samples(summaries, num_per_cat)
+    # ---- pass 2: render scene-level composite + rolling GIF picks ----
+    # Build a viz-only SceneLoader that loads our 4 used cams + LiDAR at
+    # ALL iterations (training mask only keeps t=0). Required for the
+    # composite GIFs to actually show camera + LiDAR motion across the
+    # scene timeline.
+    from collections import defaultdict
+    from navsim.common.dataclasses import SensorConfig as _SensorConfig
+    viz_sensor_config = _SensorConfig(
+        cam_f0=False, cam_l1=False, cam_r1=False, cam_b0=False,
+        cam_l0=True, cam_r0=True, cam_l2=True, cam_r2=True,
+        lidar_pc=True,
+    )
+    viz_scene_loader = SceneLoader(
+        sensor_blobs_path=Path(cfg.sensor_blobs_path),
+        data_path=Path(cfg.navsim_log_path),
+        scene_filter=val_scene_filter,
+        sensor_config=viz_sensor_config,
+    )
+    tokens_per_log = viz_scene_loader.get_tokens_list_per_log()
+    sample_to_scene: Dict[str, str] = {
+        st: log for log, samps in tokens_per_log.items() for st in samps
+    }
 
-    # ---- pass 2: render picked samples via navsim BEV helpers ----
-    # We cannot use `plot_bev_with_agent` directly because its internal
-    # `agent.compute_trajectory(...)` keeps features on CPU and would
-    # crash when the agent lives on GPU (CPU input vs GPU weights).
-    # Instead, compute the predicted trajectory manually with explicit
-    # device move and pass to `_render_bev_panel`.
-    count = 0
-    for category, items in picks.items():
+    # Aggregate per-scene sample summaries for downstream pickers.
+    scene_to_samples: Dict[str, List[Tuple[str, float, int, float, float]]] = defaultdict(list)
+    for s in summaries:
+        scene_t = sample_to_scene.get(s[0])
+        if scene_t is not None:
+            scene_to_samples[scene_t].append(s)
+
+    emit_gif = bool(cfg.get("viz", {}).get("emit_gif", True))
+
+    # All "categories" map to scene-level picks. Counts read from
+    # `+viz.<category>=N`; backwards-compat: also honour the legacy
+    # `+viz.num_per_category=N` for {worst, best, random}.
+    legacy_n = int(cfg.get("viz", {}).get("num_per_category", 0) or 0)
+    category_n = {
+        "worst":      int(cfg.get("viz", {}).get("worst",      legacy_n or 3)),
+        "best":       int(cfg.get("viz", {}).get("best",       legacy_n or 3)),
+        "random":     int(cfg.get("viz", {}).get("random",     legacy_n or 3)),
+        "curvy":      int(cfg.get("viz", {}).get("curvy_top_k", 0) or 0),
+        "weighted":   int(cfg.get("viz", {}).get("weighted",   0) or 0),
+        "unweighted": int(cfg.get("viz", {}).get("unweighted", 0) or 0),
+    }
+    container_json = cfg.get("viz", {}).get(
+        "container_split_json", "data/analysis/scene_container_split.json"
+    )
+    trailer_json = cfg.get("viz", {}).get(
+        "trailer_split_json", "data/analysis/scene_trailer_split.json"
+    )
+
+    # Resolve each category's pick list.
+    picks_by_category: Dict[str, List[Tuple[str, str, Dict]]] = {}
+    if category_n["worst"] > 0:
+        picks_by_category["worst"] = _scene_picks_by_l2(
+            scene_to_samples, "worst", category_n["worst"]
+        )
+    if category_n["best"] > 0:
+        picks_by_category["best"] = _scene_picks_by_l2(
+            scene_to_samples, "best", category_n["best"]
+        )
+    if category_n["random"] > 0:
+        picks_by_category["random"] = _scene_picks_by_l2(
+            scene_to_samples, "random", category_n["random"]
+        )
+    if category_n["curvy"] > 0:
+        picks_by_category["curvy"] = [
+            (st, ps, {"peak_dheading_4s_deg": round(d, 2)})
+            for st, ps, d in _curvy_picks_by_scene(
+                summaries, sample_to_scene, category_n["curvy"]
+            )
+        ]
+    if category_n["weighted"] > 0:
+        picks_by_category["weighted"] = _scene_picks_by_load(
+            Path(container_json), Path(trailer_json),
+            scene_to_samples, "weighted", category_n["weighted"]
+        )
+    if category_n["unweighted"] > 0:
+        picks_by_category["unweighted"] = _scene_picks_by_load(
+            Path(container_json), Path(trailer_json),
+            scene_to_samples, "unweighted", category_n["unweighted"]
+        )
+
+    # Render each category through the unified scene-pick renderer.
+    all_records: Dict[str, List[Dict]] = {}
+    for category, picks_list in picks_by_category.items():
         cat_dir = viz_dir / category
         cat_dir.mkdir(exist_ok=True)
-        for token, avg_l2, cmd, gt_disp, dh4s in items:
-            scene = val_scene_loader.get_scene_from_token(token)
-            agent_input = scene.get_agent_input()
-            gt_trajectory = scene.get_future_trajectory().poses
-            features = {}
-            for b in agent.get_feature_builders():
-                features.update(b.compute_features(agent_input))
-            features = {k: v.unsqueeze(0).to(device) for k, v in features.items()}
-            with torch.no_grad():
-                predictions = agent.forward(features)
-            pred_trajectory = (
-                predictions["trajectory"].squeeze(0).detach().cpu().numpy()
-            )
-
-            fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-            _render_bev_panel(ax, scene, gt_trajectory, pred_trajectory)
-            ax.set_title(
-                f"[{category}] cmd={CMD_LABELS.get(cmd, '?')}  "
-                f"avg L2={avg_l2:.2f} m  gt_disp={gt_disp:.1f} m\n{token}",
-                fontsize=9,
-            )
-            fig.tight_layout()
-            out_png = cat_dir / f"{token}.png"
-            fig.savefig(out_png, dpi=120)
-            plt.close(fig)
-            count += 1
-
-    # picks.json for traceability.
-    (viz_dir / "picks.json").write_text(json.dumps({
-        category: [
-            {"token": t, "avg_l2": l, "cmd": c, "gt_disp_m": d}
-            for t, l, c, d, dh in items
-        ]
-        for category, items in picks.items()
-    }, indent=2))
-
-    # ---- optional GIFs ----
-    # For each picked sample also render a short GIF that scrubs a
-    # "current-time" marker along the GT and predicted trajectories
-    # against the same BEV background. Useful for spotting where /
-    # when the prediction diverges from the human driver.
-    if bool(cfg.get("viz", {}).get("emit_gif", True)):
-        _emit_gifs(picks, val_scene_loader, agent, viz_dir, device)
-
-    # ---- optional curvy-scene composite mode ----
-    # `+viz.curvy_top_k=N +viz.curvy_json=/path/to/scene_curvy_split.json`
-    # picks the top-N most-curvy val scenes and renders a 2x3 composite
-    # (4 cams + BEV + stats) PNG plus a GIF where the cameras advance
-    # through the future frames while the BEV stays fixed at t=0.
-    curvy_top_k = int(cfg.get("viz", {}).get("curvy_top_k", 0) or 0)
-    if curvy_top_k > 0:
-        curvy_dir = viz_dir / "curvy_composite"
-        curvy_dir.mkdir(exist_ok=True)
-        # The training SceneLoader masks cameras to `cam_*=[3]` (only the
-        # current t=0 frame), so scene.frames[future_idx].cameras.cam_l0
-        # is None at all future indices and the GIF cameras show "no
-        # image". For composite GIFs we need cameras at every frame, so
-        # build a viz-only SceneLoader with the 4 used cams enabled at
-        # ALL iterations (True). The 4 unused slots stay False to avoid
-        # the Cameras.from_camera_dict NoneType subscript crash we hit
-        # back in the Phase C iter 2 bug.
-        from navsim.common.dataclasses import SensorConfig as _SensorConfig
-        viz_sensor_config = _SensorConfig(
-            cam_f0=False, cam_l1=False, cam_r1=False, cam_b0=False,
-            cam_l0=True, cam_r0=True, cam_l2=True, cam_r2=True,
-            lidar_pc=True,
-        )
-        viz_scene_loader = SceneLoader(
-            sensor_blobs_path=Path(cfg.sensor_blobs_path),
-            data_path=Path(cfg.navsim_log_path),
-            scene_filter=val_scene_filter,
-            sensor_config=viz_sensor_config,
-        )
-        # For rolling-prediction GIF, look up the next N consecutive
-        # sample-window tokens in the same scene. tokens_per_log gives
-        # {scene_token: [sample_token1, ...]} in chronological order.
-        tokens_per_log = viz_scene_loader.get_tokens_list_per_log()
-        sample_to_position: Dict[str, Tuple[str, int, List[str]]] = {}
-        for _log_name, _samps in tokens_per_log.items():
-            for _i, _st in enumerate(_samps):
-                sample_to_position[_st] = (_log_name, _i, _samps)
-        # Scene-level curvy picker: groups val samples by scene, takes the
-        # peak |Δheading@4s| per scene as the scene's curvature score,
-        # and ranks scenes descending. Each pick yields one full-scene
-        # rolling-prediction GIF (all sample windows in that scene
-        # replayed in order). The "peak" sample inside the scene serves
-        # as the title anchor + filename stem.
-        sample_to_scene: Dict[str, str] = {
-            st: log for log, samps in tokens_per_log.items() for st in samps
-        }
-        curvy = _curvy_picks_by_scene(summaries, sample_to_scene, curvy_top_k)
-        logger.info("Curvy composite mode: %d scenes selected", len(curvy))
-        curvy_records = []
-        for scene_token, peak_sample, peak_dh in curvy:
+        records = []
+        logger.info("Rendering %s: %d scene picks", category, len(picks_list))
+        for scene_token, peak_sample, meta in picks_list:
             scene_samples = tokens_per_log.get(scene_token, [])
             if not scene_samples:
-                logger.warning("Scene %s has 0 sample windows; skipping.",
-                               scene_token)
-                continue
-            # Render a static PNG centred on the peak sample (visual
-            # summary frame for the scene), then a full-scene rolling
-            # GIF that walks every sample window in chronological order.
-            scene = viz_scene_loader.get_scene_from_token(peak_sample)
-            agent_input = scene.get_agent_input()
-            gt_trajectory = scene.get_future_trajectory().poses
-            features = {}
-            for b in agent.get_feature_builders():
-                features.update(b.compute_features(agent_input))
-            features = {k: v.unsqueeze(0).to(device) for k, v in features.items()}
-            with torch.no_grad():
-                predictions = agent.forward(features)
-            pred_trajectory = (
-                predictions["trajectory"].squeeze(0).detach().cpu().numpy()
-            )
-            cmd = int(np.argmax(agent_input.ego_statuses[-1].driving_command))
-            avg_l2 = float(
-                np.nanmean(_l2_per_horizon(pred_trajectory, gt_trajectory))
-            )
-
-            title_prefix = (
-                f"cmd={CMD_LABELS.get(cmd, '?')}  "
-                f"peak |Δyaw@4s|={peak_dh:.1f}°  peak L2={avg_l2:.2f} m  "
-                f"scene={scene_token[:12]}…"
-            )
-            fig = plt.figure(figsize=(14, 7))
-            _render_composite_frame(
-                fig=fig, grid_spec=None,
-                scene=scene,
-                frame_idx_for_cams=scene.scene_metadata.num_history_frames - 1,
-                gt_trajectory_local=gt_trajectory,
-                pred_trajectory_local=pred_trajectory,
-                marker_idx=0,
-                stats_lines=[title_prefix, f"peak sample={peak_sample[:10]}…",
-                             f"scene length={len(scene_samples)} samples"],
-            )
-            png_path = curvy_dir / f"{scene_token}.png"
-            fig.savefig(png_path, dpi=120, bbox_inches="tight")
-            plt.close(fig)
-
-            if bool(cfg.get("viz", {}).get("emit_gif", True)):
-                _emit_composite_gif_rolling(
-                    picked_sample_token=peak_sample,
-                    sample_sequence=scene_samples,
-                    viz_scene_loader=viz_scene_loader,
-                    agent=agent,
-                    device=device,
-                    out_path=curvy_dir / f"{scene_token}.gif",
-                    title_prefix=title_prefix,
+                logger.warning(
+                    "Scene %s has 0 sample windows; skipping.", scene_token,
                 )
-            curvy_records.append({
-                "scene_token": scene_token, "peak_sample": peak_sample,
-                "peak_dheading_4s_deg": peak_dh,
-                "peak_cmd": cmd, "peak_avg_l2": avg_l2,
-                "scene_length_samples": len(scene_samples),
-            })
-
-        (curvy_dir / "picks.json").write_text(
-            json.dumps(curvy_records, indent=2, ensure_ascii=False)
+                continue
+            rec = _render_one_scene_pick(
+                scene_token=scene_token,
+                peak_sample_token=peak_sample,
+                scene_samples=scene_samples,
+                viz_scene_loader=viz_scene_loader,
+                agent=agent,
+                device=device,
+                out_dir=cat_dir,
+                category=category,
+                meta_dict=meta,
+                emit_gif=emit_gif,
+            )
+            records.append(rec)
+        (cat_dir / "picks.json").write_text(
+            json.dumps(records, indent=2, ensure_ascii=False)
         )
+        all_records[category] = records
+
+    (viz_dir / "picks.json").write_text(
+        json.dumps(all_records, indent=2, ensure_ascii=False)
+    )
 
 
 def _emit_gifs(picks, val_scene_loader, agent, viz_dir, device) -> None:
