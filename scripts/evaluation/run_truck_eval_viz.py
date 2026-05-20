@@ -257,25 +257,23 @@ def _emit_composite_gif(
     )
 
 
-def _curvy_picks_from_json(
-    curvy_json_path: Path,
+def _curvy_picks_by_sample(
+    summaries_with_curv: List[Tuple[str, float, int, float, float]],
     top_k: int,
-    val_token_set: set,
 ) -> List[Tuple[str, float]]:
-    """Load the existing curvy ranking and return the top-K val tokens.
+    """Sample-level curvy picker.
 
-    `scene_curvy_split.json` (from transfuser-truckscenes/tools/find_curvy_scenes.py)
-    is a list of {token, curvature, ...} already sorted descending by curvature.
+    Sorts samples by |Δheading@4s| (in the GT future trajectory) descending
+    and returns the top-K (sample_token, abs_dheading_deg) pairs. This is
+    finer-grained than the scene-level scene_curvy_split.json: it pinpoints
+    the actual sample inside a scene where the truck is most actively
+    turning, which is what makes a useful "curvy" viz case.
+
+    Expected summary tuple layout:
+        (sample_token, avg_l2, cmd, gt_max_disp, abs_dheading_4s_deg)
     """
-    payload = json.loads(curvy_json_path.read_text())
-    scenes = payload.get("scenes", [])
-    picks = []
-    for s in scenes:
-        if s["token"] in val_token_set:
-            picks.append((s["token"], float(s.get("curvature", 0.0))))
-            if len(picks) >= top_k:
-                break
-    return picks
+    ranked = sorted(summaries_with_curv, key=lambda x: x[4], reverse=True)
+    return [(t, c) for (t, _l2, _cmd, _disp, c) in ranked[:top_k]]
 
 
 def _l2_per_horizon(pred: np.ndarray, gt: np.ndarray) -> List[float]:
@@ -403,7 +401,11 @@ def main(cfg: DictConfig) -> None:
         # max GT displacement from origin -- used to filter near-
         # stationary samples (parked/stopped trucks where L2≈0 is trivial).
         gt_max_disp = float(np.max(np.linalg.norm(gt_trajectory[:, :2], axis=-1)))
-        summaries.append((token, avg_l2, cmd, gt_max_disp))
+        # sample-level curvature: |Δheading| at the final GT pose (4 s).
+        # GT trajectory is in local ego frame, so the first pose's heading
+        # is 0 and the last pose's heading == total yaw change.
+        dheading_4s_deg = float(np.degrees(abs(gt_trajectory[-1, 2])))
+        summaries.append((token, avg_l2, cmd, gt_max_disp, dheading_4s_deg))
 
     picks = _pick_samples(summaries, num_per_cat)
 
@@ -417,7 +419,7 @@ def main(cfg: DictConfig) -> None:
     for category, items in picks.items():
         cat_dir = viz_dir / category
         cat_dir.mkdir(exist_ok=True)
-        for token, avg_l2, cmd, gt_disp in items:
+        for token, avg_l2, cmd, gt_disp, dh4s in items:
             scene = val_scene_loader.get_scene_from_token(token)
             agent_input = scene.get_agent_input()
             gt_trajectory = scene.get_future_trajectory().poses
@@ -448,7 +450,7 @@ def main(cfg: DictConfig) -> None:
     (viz_dir / "picks.json").write_text(json.dumps({
         category: [
             {"token": t, "avg_l2": l, "cmd": c, "gt_disp_m": d}
-            for t, l, c, d in items
+            for t, l, c, d, dh in items
         ]
         for category, items in picks.items()
     }, indent=2))
@@ -467,15 +469,16 @@ def main(cfg: DictConfig) -> None:
     # (4 cams + BEV + stats) PNG plus a GIF where the cameras advance
     # through the future frames while the BEV stays fixed at t=0.
     curvy_top_k = int(cfg.get("viz", {}).get("curvy_top_k", 0) or 0)
-    curvy_json = cfg.get("viz", {}).get("curvy_json", None)
-    if curvy_top_k > 0 and curvy_json:
+    if curvy_top_k > 0:
         curvy_dir = viz_dir / "curvy_composite"
         curvy_dir.mkdir(exist_ok=True)
-        val_token_set = set(val_scene_loader.tokens)
-        curvy = _curvy_picks_from_json(
-            Path(curvy_json), curvy_top_k, val_token_set
-        )
-        logger.info("Curvy composite mode: %d scenes selected", len(curvy))
+        # Sample-level curvy picker: ranks all val samples by |Δheading@4s|
+        # (the GT future yaw change recorded in the scoring pass) and takes
+        # the top-K. Avoids the scene_token / sample_token mismatch that
+        # the JSON-based picker had, and pinpoints the actual sample where
+        # the truck is most actively turning.
+        curvy = _curvy_picks_by_sample(summaries, curvy_top_k)
+        logger.info("Curvy composite mode: %d samples selected", len(curvy))
         curvy_records = []
         for token, curvature in curvy:
             scene = val_scene_loader.get_scene_from_token(token)
@@ -495,7 +498,7 @@ def main(cfg: DictConfig) -> None:
 
             title_prefix = (
                 f"cmd={CMD_LABELS.get(cmd, '?')}  "
-                f"curvature={curvature:.2f}  avg_L2={avg_l2:.2f} m  "
+                f"|Δyaw@4s|={curvature:.1f}°  avg_L2={avg_l2:.2f} m  "
                 f"{token[:12]}…"
             )
             # static PNG: t=0 frame
@@ -523,8 +526,8 @@ def main(cfg: DictConfig) -> None:
                     title_prefix=title_prefix,
                 )
             curvy_records.append({
-                "token": token, "curvature": curvature, "cmd": cmd,
-                "avg_l2": avg_l2,
+                "token": token, "dheading_4s_deg": curvature,
+                "cmd": cmd, "avg_l2": avg_l2,
             })
 
         (curvy_dir / "picks.json").write_text(
@@ -547,7 +550,7 @@ def _emit_gifs(picks, val_scene_loader, agent, viz_dir, device) -> None:
 
     for category, items in picks.items():
         cat_dir = viz_dir / category
-        for token, avg_l2, cmd, gt_disp in items:
+        for token, avg_l2, cmd, gt_disp, dh4s in items:
             scene = val_scene_loader.get_scene_from_token(token)
             agent_input = scene.get_agent_input()
             gt_trajectory = scene.get_future_trajectory().poses
