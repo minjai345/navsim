@@ -47,7 +47,16 @@ from navsim.common.dataclasses import SceneFilter
 from navsim.common.dataloader import SceneLoader
 from navsim.evaluation.truck_l2_collision import DEFAULT_INTERVAL_S, EVAL_HORIZONS
 import navsim.visualization.config as viz_config
-from navsim.visualization.plots import plot_bev_with_agent
+from navsim.visualization.bev import (
+    add_configured_bev_on_ax,
+    add_trajectory_to_bev_ax,
+)
+from navsim.visualization.camera import add_camera_ax
+from navsim.visualization.plots import (
+    configure_ax,
+    configure_bev_ax,
+    plot_bev_with_agent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +81,201 @@ def _load_checkpoint_into_agent(agent: AbstractAgent, ckpt_path: Path) -> None:
         logger.warning(
             "Load mismatch: %d missing, %d unexpected", len(missing), len(unexpected)
         )
+
+
+def _render_bev_panel(
+    ax,
+    scene,
+    gt_trajectory: np.ndarray,
+    pred_trajectory: np.ndarray,
+) -> None:
+    """Fill one matplotlib axis with the BEV (annotations + lidar) + GT/Pred
+    trajectories. Same content as plot_bev_with_agent but writes to a given
+    ax instead of creating its own figure. Lets us drop the BEV into a
+    composite grid alongside the camera panels.
+    """
+    from navsim.visualization.config import TRAJECTORY_CONFIG
+    from navsim.common.dataclasses import Trajectory
+
+    frame_idx = scene.scene_metadata.num_history_frames - 1
+    add_configured_bev_on_ax(ax, scene.map_api, scene.frames[frame_idx])
+    add_trajectory_to_bev_ax(ax, Trajectory(gt_trajectory), TRAJECTORY_CONFIG["human"])
+    add_trajectory_to_bev_ax(ax, Trajectory(pred_trajectory), TRAJECTORY_CONFIG["agent"])
+    configure_bev_ax(ax)
+    configure_ax(ax)
+
+
+# Map our 4-cam TruckScenes layout to a 2x2 grid: top row = front, bottom = back.
+# Slot names are navsim attribute names on Cameras (cam_l0=LEFT_FRONT etc).
+_CAM_GRID = [
+    ("cam_l0", "LEFT_FRONT"),
+    ("cam_r0", "RIGHT_FRONT"),
+    ("cam_l2", "LEFT_BACK"),
+    ("cam_r2", "RIGHT_BACK"),
+]
+
+
+def _render_composite_frame(
+    fig,
+    grid_spec,
+    scene,
+    frame_idx_for_cams: int,
+    gt_trajectory_t0: np.ndarray,
+    pred_trajectory_t0: np.ndarray,
+    marker_idx: int,
+    stats_lines: List[str],
+) -> None:
+    """Draw a 2x3 composite figure: 4 cameras + BEV(t=0) + stats text.
+
+    Layout:
+        ┌──────────────┬──────────────┬──────────────┐
+        │  LEFT_FRONT  │              │  RIGHT_FRONT │
+        ├──────────────┤     BEV      ├──────────────┤
+        │  LEFT_BACK   │              │  RIGHT_BACK  │
+        └──────────────┴──────────────┴──────────────┘
+                                  +
+                                stats
+
+    Cameras come from `scene.frames[frame_idx_for_cams]` so they change over
+    time across GIF frames. BEV is drawn at t=0 with the GT/Pred trajectory
+    overlay + a large marker at `marker_idx` along each trajectory.
+    """
+    fig.clear()
+    gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.0, 0.18],
+                          hspace=0.04, wspace=0.04)
+
+    # ---- camera panels ----
+    cam_axes = [
+        fig.add_subplot(gs[0, 0]),
+        fig.add_subplot(gs[0, 2]),
+        fig.add_subplot(gs[1, 0]),
+        fig.add_subplot(gs[1, 2]),
+    ]
+    frame = scene.frames[frame_idx_for_cams]
+    for ax, (cam_attr, label) in zip(cam_axes, _CAM_GRID):
+        camera = getattr(frame.cameras, cam_attr, None)
+        if camera is not None and getattr(camera, "image", None) is not None:
+            add_camera_ax(ax, camera)
+        else:
+            ax.set_facecolor("#222")
+            ax.text(0.5, 0.5, "no image", color="white",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=9)
+        ax.set_title(label, fontsize=8)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    # ---- BEV panel ----
+    bev_ax = fig.add_subplot(gs[0:2, 1])
+    _render_bev_panel(bev_ax, scene, gt_trajectory_t0, pred_trajectory_t0)
+
+    # Trajectory progress markers (BEV axes convention: y_world plotted on
+    # x-screen, x_world on y-screen, x-axis inverted -- mirrors
+    # add_trajectory_to_bev_ax).
+    gt_xy = np.concatenate(
+        [np.zeros((1, 2)), gt_trajectory_t0[:, :2]], axis=0
+    )
+    pr_xy = np.concatenate(
+        [np.zeros((1, 2)), pred_trajectory_t0[:, :2]], axis=0
+    )
+    k = max(0, min(marker_idx, gt_xy.shape[0] - 1, pr_xy.shape[0] - 1))
+    bev_ax.scatter([gt_xy[k, 1]], [gt_xy[k, 0]],
+                   s=120, c="#2ca02c", edgecolors="black",
+                   linewidths=1.2, zorder=6)
+    bev_ax.scatter([pr_xy[k, 1]], [pr_xy[k, 0]],
+                   s=120, c="#d62728", edgecolors="black",
+                   linewidths=1.2, zorder=6)
+
+    # ---- stats banner (bottom row spanning all 3 cols) ----
+    stats_ax = fig.add_subplot(gs[2, :])
+    stats_ax.axis("off")
+    stats_ax.text(
+        0.5, 0.5, " | ".join(stats_lines),
+        ha="center", va="center", transform=stats_ax.transAxes,
+        fontsize=9, family="monospace",
+    )
+
+
+def _emit_composite_gif(
+    scene,
+    gt_trajectory: np.ndarray,
+    pred_trajectory: np.ndarray,
+    out_path: Path,
+    title_prefix: str,
+    duration_ms: int = 400,
+) -> None:
+    """Render a 2x3 composite GIF.
+
+    Each GIF frame `k` (k = 0..num_future_frames):
+      * cameras come from `scene.frames[num_history-1 + k]`
+        -> the 4 camera views actually advance through time
+      * BEV(t=0) stays fixed (LiDAR + annotations at the starting frame)
+      * GT and predicted markers scrub along their trajectories at step k
+
+    Cameras updating means you see the road change as the truck moves;
+    BEV stays fixed so the two trajectories remain visible end-to-end
+    (paper-style trajectory comparison).
+    """
+    import io
+    from PIL import Image
+
+    num_history = scene.scene_metadata.num_history_frames
+    num_future = scene.scene_metadata.num_future_frames
+    # GIF spans the current frame + num_future_frames forward poses, so
+    # camera frames and trajectory marker step together.
+    n_steps = min(num_future + 1, gt_trajectory.shape[0] + 1, pred_trajectory.shape[0] + 1)
+
+    fig = plt.figure(figsize=(14, 7))
+    frames = []
+    for k in range(n_steps):
+        frame_idx_for_cams = min(num_history - 1 + k, len(scene.frames) - 1)
+        stats = [
+            f"{title_prefix}",
+            f"t=+{k * DEFAULT_INTERVAL_S:.1f}s",
+            f"frame={frame_idx_for_cams}",
+        ]
+        _render_composite_frame(
+            fig=fig,
+            grid_spec=None,
+            scene=scene,
+            frame_idx_for_cams=frame_idx_for_cams,
+            gt_trajectory_t0=gt_trajectory,
+            pred_trajectory_t0=pred_trajectory,
+            marker_idx=k,
+            stats_lines=stats,
+        )
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        buf.seek(0)
+        frames.append(Image.open(buf).copy())
+        buf.close()
+    plt.close(fig)
+
+    frames[0].save(
+        out_path, save_all=True, append_images=frames[1:],
+        duration=duration_ms, loop=0,
+    )
+
+
+def _curvy_picks_from_json(
+    curvy_json_path: Path,
+    top_k: int,
+    val_token_set: set,
+) -> List[Tuple[str, float]]:
+    """Load the existing curvy ranking and return the top-K val tokens.
+
+    `scene_curvy_split.json` (from transfuser-truckscenes/tools/find_curvy_scenes.py)
+    is a list of {token, curvature, ...} already sorted descending by curvature.
+    """
+    payload = json.loads(curvy_json_path.read_text())
+    scenes = payload.get("scenes", [])
+    picks = []
+    for s in scenes:
+        if s["token"] in val_token_set:
+            picks.append((s["token"], float(s.get("curvature", 0.0))))
+            if len(picks) >= top_k:
+                break
+    return picks
 
 
 def _l2_per_horizon(pred: np.ndarray, gt: np.ndarray) -> List[float]:
@@ -242,6 +446,76 @@ def main(cfg: DictConfig) -> None:
     # when the prediction diverges from the human driver.
     if bool(cfg.get("viz", {}).get("emit_gif", True)):
         _emit_gifs(picks, val_scene_loader, agent, viz_dir, device)
+
+    # ---- optional curvy-scene composite mode ----
+    # `+viz.curvy_top_k=N +viz.curvy_json=/path/to/scene_curvy_split.json`
+    # picks the top-N most-curvy val scenes and renders a 2x3 composite
+    # (4 cams + BEV + stats) PNG plus a GIF where the cameras advance
+    # through the future frames while the BEV stays fixed at t=0.
+    curvy_top_k = int(cfg.get("viz", {}).get("curvy_top_k", 0) or 0)
+    curvy_json = cfg.get("viz", {}).get("curvy_json", None)
+    if curvy_top_k > 0 and curvy_json:
+        curvy_dir = viz_dir / "curvy_composite"
+        curvy_dir.mkdir(exist_ok=True)
+        val_token_set = set(val_scene_loader.tokens)
+        curvy = _curvy_picks_from_json(
+            Path(curvy_json), curvy_top_k, val_token_set
+        )
+        logger.info("Curvy composite mode: %d scenes selected", len(curvy))
+        curvy_records = []
+        for token, curvature in curvy:
+            scene = val_scene_loader.get_scene_from_token(token)
+            agent_input = scene.get_agent_input()
+            gt_trajectory = scene.get_future_trajectory().poses
+            features = {}
+            for b in agent.get_feature_builders():
+                features.update(b.compute_features(agent_input))
+            features = {k: v.unsqueeze(0).to(device) for k, v in features.items()}
+            with torch.no_grad():
+                predictions = agent.forward(features)
+            pred_trajectory = (
+                predictions["trajectory"].squeeze(0).detach().cpu().numpy()
+            )
+            cmd = int(np.argmax(agent_input.ego_statuses[-1].driving_command))
+            avg_l2 = float(np.nanmean(_l2_per_horizon(pred_trajectory, gt_trajectory)))
+
+            title_prefix = (
+                f"cmd={CMD_LABELS.get(cmd, '?')}  "
+                f"curvature={curvature:.2f}  avg_L2={avg_l2:.2f} m  "
+                f"{token[:12]}…"
+            )
+            # static PNG: t=0 frame
+            fig = plt.figure(figsize=(14, 7))
+            _render_composite_frame(
+                fig=fig, grid_spec=None,
+                scene=scene,
+                frame_idx_for_cams=scene.scene_metadata.num_history_frames - 1,
+                gt_trajectory_t0=gt_trajectory,
+                pred_trajectory_t0=pred_trajectory,
+                marker_idx=0,
+                stats_lines=[title_prefix, "t=+0.0s", "frame=current"],
+            )
+            png_path = curvy_dir / f"{token}.png"
+            fig.savefig(png_path, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+
+            # GIF: cameras advance per future frame, BEV stays at t=0
+            if bool(cfg.get("viz", {}).get("emit_gif", True)):
+                _emit_composite_gif(
+                    scene=scene,
+                    gt_trajectory=gt_trajectory,
+                    pred_trajectory=pred_trajectory,
+                    out_path=curvy_dir / f"{token}.gif",
+                    title_prefix=title_prefix,
+                )
+            curvy_records.append({
+                "token": token, "curvature": curvature, "cmd": cmd,
+                "avg_l2": avg_l2,
+            })
+
+        (curvy_dir / "picks.json").write_text(
+            json.dumps(curvy_records, indent=2, ensure_ascii=False)
+        )
 
 
 def _emit_gifs(picks, val_scene_loader, agent, viz_dir, device) -> None:
