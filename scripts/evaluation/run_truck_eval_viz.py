@@ -650,7 +650,11 @@ def main(cfg: DictConfig) -> None:
         logger.info("Curvy composite mode: %d samples selected", len(curvy))
         curvy_records = []
         for token, curvature in curvy:
-            scene = val_scene_loader.get_scene_from_token(token)
+            # Use the viz-only SceneLoader so cameras + LiDAR are loaded
+            # at every frame (not just t=0); the agent-restricted loader
+            # masks future frames and the GIF cameras / BEV would go blank
+            # after frame 0.
+            scene = viz_scene_loader.get_scene_from_token(token)
             agent_input = scene.get_agent_input()
             gt_trajectory = scene.get_future_trajectory().poses
             features = {}
